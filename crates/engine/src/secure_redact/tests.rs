@@ -353,23 +353,40 @@ fn a_marked_word_read_again_in_part_still_counts() {
     assert!(!read_again("the", "thermometer"));
 }
 
-/// A colour space the page inherits (/DefaultRGB that paints nothing) doesn't make the boxes
-/// transparent: the mask page has resources of its own.
+/// A colour space the page has or inherits from the page tree (/DefaultRGB that paints
+/// nothing) doesn't make the boxes transparent: the mask page has empty resources of its own,
+/// and the page tree above it has none.
 #[test]
 fn inherited_colour_spaces_do_not_hide_the_boxes() {
+    let default_rgb = "/ColorSpace << /DefaultRGB [/DeviceN [/None /None /None] /DeviceRGB 6 0 R] >>";
     let function = stream("/FunctionType 4 /Domain [0 1 0 1 0 1] /Range [0 1 0 1 0 1]", "{}");
-    let file = page("/ColorSpace << /DefaultRGB [/DeviceN [/None /None /None] /DeviceRGB 6 0 R] >>", &format!("0 g {VISIBLE}"), "", "", &[function]);
-    let mut s = Session::new();
-    let id = s.open("cs.pdf", None, Arc::new(file), None).unwrap();
-    let word = shown_rect(&s, id, SECRET);
-    mark(&mut s, id, SECRET);
-    let img = render(&copy(&s, id).bytes, 1.0);
-    let [x0, y0, x1, y1] = word;
-    let light = ((y0.ceil() as u32)..(y1.floor() as u32))
-        .flat_map(|y| ((x0.ceil() as u32)..(x1.floor() as u32)).map(move |x| (x, y)))
-        .filter(|&(x, y)| px(&img, x as f32, y as f32)[0] > 60)
-        .count();
-    assert_eq!(light, 0, "the box doesn't cover the word");
+    let on_page = page(default_rgb, &format!("0 g {VISIBLE}"), "", "", std::slice::from_ref(&function));
+    let on_tree = pdf(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            format!("<< /Type /Pages /Kids [7 0 R] /Count 1 /MediaBox [0 0 612 300] /Resources << {default_rgb} >> >>"),
+            "<< /Type /Pages /Kids [] /Count 0 >>".to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_string(),
+            stream("", &format!("0 g {VISIBLE}")),
+            function,
+            "<< /Type /Pages /Parent 2 0 R /Kids [8 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 7 0 R /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_string(),
+        ],
+        "",
+    );
+    for (name, file) in [("on the page", on_page), ("on the page tree", on_tree)] {
+        let mut s = Session::new();
+        let id = s.open("cs.pdf", None, Arc::new(file), None).unwrap();
+        let word = shown_rect(&s, id, SECRET);
+        mark(&mut s, id, SECRET);
+        let img = render(&copy(&s, id).bytes, 1.0);
+        let [x0, y0, x1, y1] = word;
+        let light = ((y0.ceil() as u32)..(y1.floor() as u32))
+            .flat_map(|y| ((x0.ceil() as u32)..(x1.floor() as u32)).map(move |x| (x, y)))
+            .filter(|&(x, y)| px(&img, x as f32, y as f32)[0] > 60)
+            .count();
+        assert_eq!(light, 0, "{name}: the box doesn't cover the word");
+    }
 }
 
 /// A Redact annotation written in place (not an object) can't be found again, so it is

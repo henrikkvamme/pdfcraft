@@ -579,14 +579,25 @@ pub(crate) fn apply_body(ui: &mut egui::Ui, marks: usize, secure: &mut bool, req
     ui.set_width(420.0);
     ui.label(egui::RichText::new(tl!("Apply redactions")).font(crate::theme::semibold(18.0)));
     ui.add_space(8.0);
-    ui.label(if marks == 1 {
+    if required_by.is_some() {
+        *secure = true;
+    }
+    ui.label(if *secure {
+        if marks == 1 {
+            tl!("You are about to apply 1 redaction mark in a new, secure copy of this document. This document stays as it is.").to_string()
+        } else {
+            crate::i18n::fmt(
+                tl!("You are about to apply {n} redaction marks in a new, secure copy of this document. This document stays as it is."),
+                &[("n", &marks.to_string())],
+            )
+        }
+    } else if marks == 1 {
         tl!("You are about to apply 1 redaction mark. Text, images and drawings under the marks, and comments and form fields that overlap them, are removed permanently.").to_string()
     } else {
         crate::i18n::fmt(tl!("You are about to apply {n} redaction marks. Text, images and drawings under the marks, and comments and form fields that overlap them, are removed permanently."), &[("n", &marks.to_string())])
     });
     ui.add_space(8.0);
     if let Some(by) = required_by {
-        *secure = true;
         ui.label(tl!("A secure redacted copy will be made: a new document in which every page is a picture, with the marks painted in. Nothing else from this document goes into it. Text is read again with OCR."));
         ui.add_space(4.0);
         ui.label(egui::RichText::new(crate::i18n::fmt(tl!("Required by {source}."), &[("source", by)])).small().color(t.text_muted));

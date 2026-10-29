@@ -267,7 +267,27 @@ fn prepare(job: &SecureJob) -> Result<(Vec<u8>, Vec<u8>), SecureError> {
     pdfcraft_print::keep_printed(&mut cos, Content::Document);
     let printed = write_incremental(&cos, &SaveOptions::default()).map_err(err)?;
     let mut mask = pdfcraft_cos::Document::open_with_password(job.bytes.clone(), password).map_err(err)?;
-    for (index, page) in pdfcraft_model::pages(&mask).into_iter().enumerate() {
+    let pages = pdfcraft_model::pages(&mask);
+    // Resources are looked up through the page tree too (a /DefaultRGB on a /Pages node applies
+    // to its pages): take them off every node above a page, so only the page's own, empty ones
+    // count.
+    let mut nodes: HashSet<ObjRef> = HashSet::new();
+    for page in &pages {
+        let mut at = mask.get(page.obj).as_dict().and_then(|d| d.reference(b"Parent"));
+        while let Some(node) = at {
+            if !nodes.insert(node) {
+                break;
+            }
+            at = mask.get(node).as_dict().and_then(|d| d.reference(b"Parent"));
+        }
+    }
+    for node in nodes {
+        mask.update_dict(node, |d| {
+            d.remove(b"Resources");
+        })
+        .map_err(err)?;
+    }
+    for (index, page) in pages.into_iter().enumerate() {
         let info = job.infos.get(index);
         let marks: Vec<&Mark> = job.marks.iter().filter(|m| m.page == index).collect();
         let content = match info {
