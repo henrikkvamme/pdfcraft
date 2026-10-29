@@ -378,7 +378,25 @@ fn inherited_colour_spaces_do_not_hide_the_boxes() {
             "",
         )
     };
+    // A /Pages node written in place in an indirect /Kids array, before a reference to the same
+    // subtree: the renderer reaches the page through the node in place, the page walk through
+    // the reference.
+    let in_place = pdf(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids 9 0 R /Count 1 /MediaBox [0 0 612 300] >>".to_string(),
+            "<< /Type /Pages /Kids [] /Count 0 >>".to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_string(),
+            stream("", &format!("0 g {VISIBLE}")),
+            function.clone(),
+            "<< /Type /Pages /Kids [8 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 7 0 R /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_string(),
+            format!("[<< /Type /Pages /Resources << {default_rgb} >> /Kids [7 0 R] /Count 1 >> 7 0 R]"),
+        ],
+        "",
+    );
     for (name, file) in [
+        ("a /Pages node written in place", in_place),
         ("on the page", on_page),
         ("on the page tree", on_tree("/Parent 7 0 R")),
         ("on the page tree, no /Parent", on_tree("")),

@@ -128,7 +128,9 @@ pub struct SecureCopy {
 pub struct SecureJob {
     bytes: Arc<Vec<u8>>,
     config: RenderConfig,
-    infos: Vec<PageInfo>,
+    /// Each page's displayed size in points, in the order the page walk finds them (the order of
+    /// the marks' page numbers and of the flattened documents [`prepare`] renders).
+    sizes: Vec<(f32, f32)>,
     marks: Vec<Mark>,
     /// The marked words to look for again in the output, lower case.
     words: Vec<String>,
@@ -140,13 +142,13 @@ pub struct SecureJob {
 impl SecureJob {
     /// Pages to render, for progress.
     pub fn pages(&self) -> usize {
-        self.infos.len()
+        self.sizes.len()
     }
 
     /// Make the copy. `ocr` reads the text layer (`None`: no text layer). `progress(done,
     /// total)` is called before each page; returning `false` stops with [`SecureError::Cancelled`].
     pub fn run(self, ocr: Option<&pdfcraft_ocr::Ocr>, mut progress: impl FnMut(usize, usize) -> bool) -> Result<SecureCopy, SecureError> {
-        let total = self.infos.len();
+        let total = self.sizes.len();
         let (printed, mask) = guard(|| prepare(&self)).map_err(SecureError::Internal)??;
         let config = RenderConfig { transparent: false, hide_comments: false, ..self.config.clone() };
         let mut page_r = PageRenderer::new(Arc::new(printed), config.clone());
@@ -158,11 +160,11 @@ impl SecureJob {
             SecureReport { pages: Vec::with_capacity(total), marks: self.marks.len(), searchable: ocr.is_some(), still_found: Vec::new(), bytes: 0 };
         let mut found: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         let mut size = 0usize;
-        for (page, info) in self.infos.iter().enumerate() {
+        for (page, &(pw, ph)) in self.sizes.iter().enumerate() {
             if !progress(page, total) {
                 return Err(SecureError::Cancelled);
             }
-            let scale = render_scale(info, self.options.dpi);
+            let scale = render_scale(pw, ph, self.options.dpi);
             let shot = page_r.render(RenderRequest { page, scale, tag: PRINT_TAG, ..Default::default() });
             if let Some(reason) = shot.error {
                 return Err(SecureError::Render { page: page + 1, reason });
@@ -189,7 +191,7 @@ impl SecureJob {
                 }
                 None => (Vec::new(), (w, h)),
             };
-            let (pw, ph) = (f64::from(info.width), f64::from(info.height));
+            let (pw, ph) = (f64::from(pw), f64::from(ph));
             let (sx, sy) = (pw / f64::from(ow.max(1)), ph / f64::from(oh.max(1)));
             let placed: Vec<pdfcraft_ocr::PlacedWord> =
                 words.iter().map(|word| pdfcraft_ocr::PlacedWord::place(word, |x, y| [f64::from(x) * sx, ph - f64::from(y) * sy])).collect();
@@ -252,82 +254,79 @@ fn for_ocr(rgba: &[u8], w: u32, h: u32, scale: f32) -> (Option<Vec<u8>>, u32, u3
     (Some(small.into_raw()), ow, oh)
 }
 
-/// The scale (device pixels per point) `info`'s page renders at for `dpi`.
-fn render_scale(info: &PageInfo, dpi: f32) -> f32 {
+/// The scale (device pixels per point) a page displayed `w` × `h` points renders at for `dpi`.
+fn render_scale(w: f32, h: f32, dpi: f32) -> f32 {
     let dpi = if dpi.is_finite() { dpi.clamp(72.0, 600.0) } else { DEFAULT_DPI };
-    pdfcraft_render::effective_scale(info.width, info.height, dpi / 72.0)
+    pdfcraft_render::effective_scale(w, h, dpi / 72.0)
 }
 
 /// The two documents to render: the source as it prints, and the same pages drawing only the
-/// marks' rectangles (unmarked pages draw nothing there).
+/// marks' rectangles (unmarked pages draw nothing there). Both get a new, flat page tree
+/// ([`flatten`]), so nothing reaches a page by inheritance and both are read page for page the
+/// same way.
 fn prepare(job: &SecureJob) -> Result<(Vec<u8>, Vec<u8>), SecureError> {
     let err = |e: pdfcraft_cos::CosError| SecureError::Internal(e.to_string());
     let password = job.config.password.as_deref();
     let mut cos = pdfcraft_cos::Document::open_with_password(job.bytes.clone(), password).map_err(err)?;
     pdfcraft_print::keep_printed(&mut cos, Content::Document);
+    let pages = pdfcraft_model::pages(&cos);
+    flatten(&mut cos, pages, |_, _, _| Ok(()))?;
     let printed = write_incremental(&cos, &SaveOptions::default()).map_err(err)?;
     let mut mask = pdfcraft_cos::Document::open_with_password(job.bytes.clone(), password).map_err(err)?;
     let pages = pdfcraft_model::pages(&mask);
-    // Resources are inherited through the page tree too (a /DefaultRGB on a /Pages node applies
-    // to its pages). Take them off every node above a page, found both ways a reader may look:
-    // down the /Kids from the catalog (as the renderer and the page walk do) and up each page's
-    // /Parent. Only the page's own, empty resources are left.
-    let mut nodes: HashSet<ObjRef> = HashSet::new();
-    let mut queue: Vec<ObjRef> = mask.root().and_then(|r| mask.get(r).as_dict().and_then(|d| d.reference(b"Pages"))).into_iter().collect();
-    let mut seen: HashSet<ObjRef> = HashSet::new();
-    while let Some(node) = queue.pop() {
-        if !seen.insert(node) {
-            continue;
-        }
-        let obj = mask.get(node);
-        let Some(kids) = obj.as_dict().and_then(|d| d.get(b"Kids")).map(|k| mask.resolve(k)) else { continue };
-        nodes.insert(node);
-        queue.extend(kids.as_array().into_iter().flatten().filter_map(Object::as_ref));
-    }
-    for page in &pages {
-        let mut at = mask.get(page.obj).as_dict().and_then(|d| d.reference(b"Parent"));
-        while let Some(node) = at {
-            if !nodes.insert(node) {
-                break;
-            }
-            at = mask.get(node).as_dict().and_then(|d| d.reference(b"Parent"));
-        }
-    }
-    // A page is never a node above another; its own resources are replaced below.
-    for page in &pages {
-        nodes.remove(&page.obj);
-    }
-    for node in nodes {
-        mask.update_dict(node, |d| {
-            d.remove(b"Resources");
-        })
-        .map_err(err)?;
-    }
-    for (index, page) in pages.into_iter().enumerate() {
-        let info = job.infos.get(index);
+    flatten(&mut mask, pages, |doc, index, page| {
         let marks: Vec<&Mark> = job.marks.iter().filter(|m| m.page == index).collect();
-        let content = match info {
-            Some(info) if !marks.is_empty() => Some(mask_content(&marks, grow_units(&page, &mask, render_scale(info, job.options.dpi)))?),
+        let content = match job.sizes.get(index) {
+            Some(&(w, h)) if !marks.is_empty() => Some(mask_content(&marks, grow_units(page, doc, render_scale(w, h, job.options.dpi)))?),
             _ => None,
         };
-        let stream = content.map(|c| mask.add(Object::Stream(Stream::flate(Dict::new(), &c))));
-        mask.update_dict(page.obj, |d| {
-            d.remove(b"Annots");
-            d.remove(b"Group");
-            // Empty resources of its own, so nothing inherited (a /DefaultRGB colour space, say)
-            // changes how the rectangles paint.
-            d.set(b"Resources".to_vec(), Object::Dict(Dict::new()));
-            match stream {
-                Some(s) => d.set(b"Contents".to_vec(), Object::Ref(s)),
-                None => {
-                    d.remove(b"Contents");
-                }
+        let stream = content.map(|c| doc.add(Object::Stream(Stream::flate(Dict::new(), &c))));
+        let d = &mut page.dict;
+        d.remove(b"Annots");
+        d.remove(b"Group");
+        // Empty resources of its own (and none above it to inherit), so nothing (a /DefaultRGB
+        // colour space, say) changes how the rectangles paint.
+        d.set(b"Resources".to_vec(), Object::Dict(Dict::new()));
+        match stream {
+            Some(s) => d.set(b"Contents".to_vec(), Object::Ref(s)),
+            None => {
+                d.remove(b"Contents");
             }
-        })
-        .map_err(err)?;
-    }
+        }
+        Ok(())
+    })?;
     let mask = write_incremental(&mask, &SaveOptions::default()).map_err(err)?;
     Ok((printed, mask))
+}
+
+/// Give `doc` a new page tree: one /Pages node without resources, its kids copies of `pages`
+/// (from [`pdfcraft_model::pages`], their inherited attributes filled in), each changed by
+/// `edit(doc, index, page)` first. However the source tree was built (inherited resources on
+/// any node, direct-dictionary kids, a /Parent that points elsewhere), a page then has only its
+/// own entries, and every reader finds the pages in the same order.
+fn flatten(
+    doc: &mut pdfcraft_cos::Document,
+    pages: Vec<pdfcraft_model::Page>,
+    mut edit: impl FnMut(&mut pdfcraft_cos::Document, usize, &mut pdfcraft_model::Page) -> Result<(), SecureError>,
+) -> Result<(), SecureError> {
+    let err = |e: pdfcraft_cos::CosError| SecureError::Internal(e.to_string());
+    let root = doc.root().ok_or_else(|| SecureError::Internal("the document has no catalog".into()))?;
+    let mut node = Dict::new();
+    node.set(b"Type".to_vec(), Object::name("Pages"));
+    let node = doc.add(node);
+    let mut kids = Vec::with_capacity(pages.len());
+    for (index, mut page) in pages.into_iter().enumerate() {
+        edit(doc, index, &mut page)?;
+        page.dict.set(b"Parent".to_vec(), Object::Ref(node));
+        kids.push(Object::Ref(doc.add(page.dict)));
+    }
+    let count = kids.len() as i64;
+    doc.update_dict(node, |d| {
+        d.set(b"Kids".to_vec(), Object::Array(kids));
+        d.set(b"Count".to_vec(), Object::Int(count));
+    })
+    .map_err(err)?;
+    doc.update_dict(root, |d| d.set(b"Pages".to_vec(), Object::Ref(node))).map_err(err)
 }
 
 /// [`GROW_PX`] device pixels in `page`'s user space at `scale` pixels per point. A user unit is
@@ -572,10 +571,20 @@ impl Session {
             return Err(SecureError::OverlayText(overlays).into());
         }
         let infos = doc.info.pages.clone();
+        let sizes = guard(|| {
+            pdfcraft_model::pages(&cos)
+                .iter()
+                .map(|p| {
+                    let (w, h) = p.display_size(&cos);
+                    (w as f32, h as f32)
+                })
+                .collect::<Vec<_>>()
+        })
+        .map_err(EditError::Invalid)?;
         let words = guard(|| marked_words(&src.bytes, &src.config, &infos, &marks)).map_err(EditError::Invalid)?;
         let stem = doc.display_name();
         let stem = stem.strip_suffix(".pdf").or_else(|| stem.strip_suffix(".PDF")).unwrap_or(&stem);
-        Ok(SecureJob { bytes: src.bytes, config: src.config, infos, marks, words, options, name: format!("{stem} (redacted).pdf") })
+        Ok(SecureJob { bytes: src.bytes, config: src.config, sizes, marks, words, options, name: format!("{stem} (redacted).pdf") })
     }
 
     /// Make a secure redacted copy of document `id` and open it as a new, unsaved document.
