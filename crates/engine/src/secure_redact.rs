@@ -268,10 +268,22 @@ fn prepare(job: &SecureJob) -> Result<(Vec<u8>, Vec<u8>), SecureError> {
     let printed = write_incremental(&cos, &SaveOptions::default()).map_err(err)?;
     let mut mask = pdfcraft_cos::Document::open_with_password(job.bytes.clone(), password).map_err(err)?;
     let pages = pdfcraft_model::pages(&mask);
-    // Resources are looked up through the page tree too (a /DefaultRGB on a /Pages node applies
-    // to its pages): take them off every node above a page, so only the page's own, empty ones
-    // count.
+    // Resources are inherited through the page tree too (a /DefaultRGB on a /Pages node applies
+    // to its pages). Take them off every node above a page, found both ways a reader may look:
+    // down the /Kids from the catalog (as the renderer and the page walk do) and up each page's
+    // /Parent. Only the page's own, empty resources are left.
     let mut nodes: HashSet<ObjRef> = HashSet::new();
+    let mut queue: Vec<ObjRef> = mask.root().and_then(|r| mask.get(r).as_dict().and_then(|d| d.reference(b"Pages"))).into_iter().collect();
+    let mut seen: HashSet<ObjRef> = HashSet::new();
+    while let Some(node) = queue.pop() {
+        if !seen.insert(node) {
+            continue;
+        }
+        let obj = mask.get(node);
+        let Some(kids) = obj.as_dict().and_then(|d| d.get(b"Kids")).map(|k| mask.resolve(k)) else { continue };
+        nodes.insert(node);
+        queue.extend(kids.as_array().into_iter().flatten().filter_map(Object::as_ref));
+    }
     for page in &pages {
         let mut at = mask.get(page.obj).as_dict().and_then(|d| d.reference(b"Parent"));
         while let Some(node) = at {
@@ -280,6 +292,10 @@ fn prepare(job: &SecureJob) -> Result<(Vec<u8>, Vec<u8>), SecureError> {
             }
             at = mask.get(node).as_dict().and_then(|d| d.reference(b"Parent"));
         }
+    }
+    // A page is never a node above another; its own resources are replaced below.
+    for page in &pages {
+        nodes.remove(&page.obj);
     }
     for node in nodes {
         mask.update_dict(node, |d| {

@@ -361,20 +361,29 @@ fn inherited_colour_spaces_do_not_hide_the_boxes() {
     let default_rgb = "/ColorSpace << /DefaultRGB [/DeviceN [/None /None /None] /DeviceRGB 6 0 R] >>";
     let function = stream("/FunctionType 4 /Domain [0 1 0 1 0 1] /Range [0 1 0 1 0 1]", "{}");
     let on_page = page(default_rgb, &format!("0 g {VISIBLE}"), "", "", std::slice::from_ref(&function));
-    let on_tree = pdf(
-        &[
-            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
-            format!("<< /Type /Pages /Kids [7 0 R] /Count 1 /MediaBox [0 0 612 300] /Resources << {default_rgb} >> >>"),
-            "<< /Type /Pages /Kids [] /Count 0 >>".to_string(),
-            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_string(),
-            stream("", &format!("0 g {VISIBLE}")),
-            function,
-            "<< /Type /Pages /Parent 2 0 R /Kids [8 0 R] /Count 1 >>".to_string(),
-            "<< /Type /Page /Parent 7 0 R /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_string(),
-        ],
-        "",
-    );
-    for (name, file) in [("on the page", on_page), ("on the page tree", on_tree)] {
+    // The page reached through /Kids 2 → 7 → 8, with its /Parent right, missing, or pointing
+    // at the empty tree 3.
+    let on_tree = |parent: &str| {
+        pdf(
+            &[
+                "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+                format!("<< /Type /Pages /Kids [7 0 R] /Count 1 /MediaBox [0 0 612 300] /Resources << {default_rgb} >> >>"),
+                "<< /Type /Pages /Kids [] /Count 0 >>".to_string(),
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_string(),
+                stream("", &format!("0 g {VISIBLE}")),
+                function.clone(),
+                "<< /Type /Pages /Parent 2 0 R /Kids [8 0 R] /Count 1 >>".to_string(),
+                format!("<< /Type /Page {parent} /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"),
+            ],
+            "",
+        )
+    };
+    for (name, file) in [
+        ("on the page", on_page),
+        ("on the page tree", on_tree("/Parent 7 0 R")),
+        ("on the page tree, no /Parent", on_tree("")),
+        ("on the page tree, the wrong /Parent", on_tree("/Parent 3 0 R")),
+    ] {
         let mut s = Session::new();
         let id = s.open("cs.pdf", None, Arc::new(file), None).unwrap();
         let word = shown_rect(&s, id, SECRET);
