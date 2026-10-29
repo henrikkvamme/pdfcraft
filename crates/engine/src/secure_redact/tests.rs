@@ -457,3 +457,60 @@ fn boxes_grow_by_the_unit_the_renderer_uses_and_keep_their_edges() {
     let c = String::from_utf8(mask_content(&[&mark], 0.0).unwrap()).unwrap();
     assert!(c.contains("0.0001 0 0.00010049 0.0005 re f"), "{c}");
 }
+
+/// A page that draws with a font only a /Pages node above it names (the renderer looks a name up
+/// there when the page's own resources lack it): the copy renders the page as the viewer does, so
+/// the word is where it was marked and the box covers it.
+#[test]
+fn a_font_inherited_by_name_keeps_the_word_under_its_box() {
+    let file = pdf(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 300] /Resources << /Font << /F1 4 0 R >> >> >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /Resources << >> /Contents 5 0 R >>".to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>".to_string(),
+            stream("", &format!("BT /F1 14 Tf 40 200 Td (WWWWWWWWWWWWWWWWWWWW {SECRET}) Tj ET")),
+        ],
+        "",
+    );
+    let mut s = Session::new();
+    let id = s.open("font.pdf", None, Arc::new(file), None).unwrap();
+    let word = shown_rect(&s, id, SECRET);
+    mark(&mut s, id, SECRET);
+    let img = render(&copy(&s, id).bytes, 1.0);
+    let [x0, y0, x1, y1] = word;
+    let light = ((y0.ceil() as u32)..(y1.floor() as u32))
+        .flat_map(|y| ((x0.ceil() as u32)..(x1.floor() as u32)).map(move |x| (x, y)))
+        .filter(|&(x, y)| px(&img, x as f32, y as f32)[0] > 60)
+        .count();
+    assert_eq!(light, 0, "the box doesn't cover the word");
+    // Nothing follows the word on its line: if the page were drawn in another font, the word
+    // would show here, beside its box.
+    let beside = ((y0.ceil() as u32)..(y1.floor() as u32))
+        .flat_map(|y| ((x1.ceil() as u32 + 4)..(x1.ceil() as u32 + 200)).map(move |x| (x, y)))
+        .filter(|&(x, y)| px(&img, x as f32, y as f32)[0] < 128)
+        .count();
+    assert_eq!(beside, 0, "the word shows beside its box");
+}
+
+/// Marks of different colours on one page are each painted in their own colour.
+#[test]
+fn each_mark_keeps_its_colour() {
+    let file = page(
+        "",
+        "",
+        "/Annots [6 0 R 7 0 R]",
+        "",
+        &[
+            "<< /Type /Annot /Subtype /Redact /Rect [100 100 200 150] /IC [1 0 0] >>".to_string(),
+            "<< /Type /Annot /Subtype /Redact /Rect [300 100 400 150] /IC [0 0 1] >>".to_string(),
+        ],
+    );
+    let mut s = Session::new();
+    let id = s.open("colours.pdf", None, Arc::new(file), None).unwrap();
+    let img = render(&copy(&s, id).bytes, 1.0);
+    // y 125 from the bottom of a 300 pt page is 175 from the top.
+    assert_eq!(px(&img, 150.0, 175.0), [255, 0, 0, 255]);
+    assert_eq!(px(&img, 350.0, 175.0), [0, 0, 255, 255]);
+    assert_eq!(px(&img, 250.0, 175.0), [255, 255, 255, 255]);
+}
