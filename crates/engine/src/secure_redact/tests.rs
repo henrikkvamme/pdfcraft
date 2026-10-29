@@ -78,7 +78,11 @@ fn mark_quads(s: &mut Session, id: DocId, quads: Vec<[f64; 8]>) {
 }
 
 fn copy(s: &Session, id: DocId) -> SecureCopy {
-    s.secure_copy_job(id, SecureOptions { dpi: 150.0, ocr: false }).unwrap().run(None, |_, _| true).unwrap()
+    copy_at(s, id, 150.0)
+}
+
+fn copy_at(s: &Session, id: DocId, dpi: f32) -> SecureCopy {
+    s.secure_copy_job(id, SecureOptions { dpi, ocr: false }).unwrap().run(None, |_, _| true).unwrap()
 }
 
 /// Every decoded stream and every string of `bytes`, and the bytes themselves.
@@ -193,16 +197,15 @@ fn nothing_of_the_source_reaches_the_copy() {
     }
 }
 
-/// A red square drawn on a page with a crop box, `/Rotate` and `/UserUnit` (down to the
-/// extreme case of a crop box 0.0005 units wide, at 75000 points each), marked exactly: no red
-/// pixel is left, because the renderer places the box as it places the square.
+/// A red square drawn on a page with a crop box, `/Rotate` and `/UserUnit`, marked exactly: no
+/// red pixel is left, because the renderer places the box as it places the square.
 #[test]
 fn boxes_cover_what_the_page_draws_whatever_its_geometry() {
-    for (crop, user_unit, rotate, square) in [
-        ([0.0, 0.0, 612.0, 300.0], 1.0, 0, [100.0, 100.0, 160.0, 140.0]),
-        ([50.0, 20.0, 400.0, 280.0], 1.0, 90, [100.0, 100.0, 160.0, 140.0]),
-        ([10.0, 10.0, 300.0, 200.0], 2.0, 270, [40.0, 30.0, 70.0, 50.0]),
-        ([0.0, 0.0, 0.0005, 0.0005], 75000.0, 0, [0.0003, 0.0, 0.0004, 0.0005]),
+    for (crop, user_unit, rotate, square, dpi) in [
+        ([0.0, 0.0, 612.0, 300.0], 1.0, 0, [100.0, 100.0, 160.0, 140.0], 150.0),
+        ([50.0, 20.0, 400.0, 280.0], 1.0, 90, [100.0, 100.0, 160.0, 140.0], 150.0),
+        ([10.0, 10.0, 300.0, 200.0], 2.0, 270, [40.0, 30.0, 70.0, 50.0], 150.0),
+        ([0.0, 0.0, 10.0, 8.0], 50.0, 90, [3.0, 4.0, 5.0, 6.0], 150.0),
     ] {
         let [x0, y0, x1, y1] = square;
         let body = format!("1 0 0 rg {x0} {y0} {} {} re f", x1 - x0, y1 - y0);
@@ -211,11 +214,15 @@ fn boxes_cover_what_the_page_draws_whatever_its_geometry() {
         let mut s = Session::new();
         let id = s.open("g.pdf", None, Arc::new(file), None).unwrap();
         mark_quads(&mut s, id, vec![pdfcraft_annot::rect_quad(square)]);
-        let out = copy(&s, id);
-        let img = render(&out.bytes, 2.0);
-        let red = img.2.as_chunks::<4>().0.iter().filter(|p| p[0] > 150 && p[1] < 100 && p[2] < 100).count();
+        let out = copy_at(&s, id, dpi);
+        let img = render(&out.bytes, dpi / 72.0);
+        // Any red tint: an edge pixel the square only partly covers is pink, not red.
+        let red = img.2.as_chunks::<4>().0.iter().filter(|p| i32::from(p[0]) - i32::from(p[1]) > 24).count();
         let dark = img.2.as_chunks::<4>().0.iter().filter(|p| p[0] < 60 && p[1] < 60 && p[2] < 60).count();
         assert_eq!(red, 0, "crop {crop:?} unit {user_unit} rotate {rotate}: red is left");
+        // The box is the square's, not the whole page: the paper beside it is still light.
+        let light = img.2.as_chunks::<4>().0.iter().filter(|p| p[0] > 200 && p[1] > 200 && p[2] > 200).count();
+        assert!(light > img.2.len() / 4 / 4, "crop {crop:?} unit {user_unit} rotate {rotate}: most of the page is dark");
         assert!(dark > 0, "crop {crop:?} unit {user_unit} rotate {rotate}: no box");
     }
 }
@@ -333,4 +340,76 @@ fn marked_words_are_read_from_under_the_marks() {
         let job = s.secure_copy_job(id, SecureOptions::default()).unwrap();
         assert_eq!(job.words, ["secret42"], "rotate {rotate}");
     }
+}
+
+#[test]
+fn a_marked_word_read_again_in_part_still_counts() {
+    assert!(read_again("kestrel7", "kestrel7"));
+    assert!(read_again("(kestrel7),", "kestrel7"));
+    assert!(read_again("kestrel", "kestrel7"), "OCR dropped a letter");
+    assert!(read_again("x-kestrel-y", "kestrel7"));
+    assert!(!read_again("kest", "kestrel7"), "too little of it");
+    assert!(!read_again("holdings", "kestrel7"));
+    assert!(!read_again("the", "thermometer"));
+}
+
+/// A colour space the page inherits (/DefaultRGB that paints nothing) doesn't make the boxes
+/// transparent: the mask page has resources of its own.
+#[test]
+fn inherited_colour_spaces_do_not_hide_the_boxes() {
+    let function = stream("/FunctionType 4 /Domain [0 1 0 1 0 1] /Range [0 1 0 1 0 1]", "{}");
+    let file = page("/ColorSpace << /DefaultRGB [/DeviceN [/None /None /None] /DeviceRGB 6 0 R] >>", &format!("0 g {VISIBLE}"), "", "", &[function]);
+    let mut s = Session::new();
+    let id = s.open("cs.pdf", None, Arc::new(file), None).unwrap();
+    let word = shown_rect(&s, id, SECRET);
+    mark(&mut s, id, SECRET);
+    let img = render(&copy(&s, id).bytes, 1.0);
+    let [x0, y0, x1, y1] = word;
+    let light = ((y0.ceil() as u32)..(y1.floor() as u32))
+        .flat_map(|y| ((x0.ceil() as u32)..(x1.floor() as u32)).map(move |x| (x, y)))
+        .filter(|&(x, y)| px(&img, x as f32, y as f32)[0] > 60)
+        .count();
+    assert_eq!(light, 0, "the box doesn't cover the word");
+}
+
+/// A Redact annotation written in place (not an object) can't be found again, so it is
+/// refused, even when another mark is listed twice and the counts would agree.
+#[test]
+fn a_mark_written_in_place_is_refused() {
+    let file = page(
+        "",
+        VISIBLE,
+        "/Annots [6 0 R 6 0 R << /Type /Annot /Subtype /Redact /Rect [40 190 200 215] >>]",
+        "",
+        &["<< /Type /Annot /Subtype /Redact /Rect [40 110 200 135] >>".to_string()],
+    );
+    let mut s = Session::new();
+    let id = s.open("inline.pdf", None, Arc::new(file), None).unwrap();
+    assert!(
+        matches!(s.secure_copy_job(id, SecureOptions::default()), Err(EditError::SecureCopy(SecureError::UnreadableMark(1)))),
+        "{:?}",
+        s.secure_copy_job(id, SecureOptions::default()).err()
+    );
+}
+
+/// The box grows by the unit the renderer uses (a /UserUnit past 75000 counts as 75000), and
+/// its edges are written in full: an edge 0.00000049 units past a six-decimal step is not
+/// rounded off. (The renderer can't draw such pages exactly, so this is checked on the numbers.)
+#[test]
+fn boxes_grow_by_the_unit_the_renderer_uses_and_keep_their_edges() {
+    let file = page("", "", "/UserUnit 1000000000", "", &[]);
+    let cos = pdfcraft_cos::Document::open(Arc::new(file)).unwrap();
+    let pg = pdfcraft_model::pages(&cos).swap_remove(0);
+    let grow = grow_units(&pg, &cos, 2.0);
+    assert!((grow - 1.0 / pdfcraft_model::MAX_USER_UNIT).abs() < 1e-15, "{grow}");
+    let mark = Mark {
+        page: 0,
+        obj: ObjRef { num: 6, generation: 0 },
+        rects: vec![[0.0001, 0.0, 0.00020049, 0.0005]],
+        fill: None,
+        overlay: String::new(),
+        look: Default::default(),
+    };
+    let c = String::from_utf8(mask_content(&[&mark], 0.0).unwrap()).unwrap();
+    assert!(c.contains("0.0001 0 0.00010049 0.0005 re f"), "{c}");
 }

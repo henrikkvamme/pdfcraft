@@ -181,17 +181,21 @@ impl SecureJob {
                 }
                 paint(&mut rgba, &m.rgba);
             }
-            let words = match ocr {
-                Some(o) => o.recognize(&rgba, w, h).map_err(|e| SecureError::Internal(e.to_string()))?.into_iter().flat_map(|l| l.words).collect(),
-                None => Vec::new(),
+            let (words, (ow, oh)) = match ocr {
+                Some(o) => {
+                    let (small, ow, oh) = for_ocr(&rgba, w, h, scale);
+                    let read = o.recognize(small.as_deref().unwrap_or(&rgba), ow, oh).map_err(|e| SecureError::Internal(e.to_string()))?;
+                    (read.into_iter().flat_map(|l| l.words).collect(), (ow, oh))
+                }
+                None => (Vec::new(), (w, h)),
             };
             let (pw, ph) = (f64::from(info.width), f64::from(info.height));
-            let (sx, sy) = (pw / f64::from(w.max(1)), ph / f64::from(h.max(1)));
+            let (sx, sy) = (pw / f64::from(ow.max(1)), ph / f64::from(oh.max(1)));
             let placed: Vec<pdfcraft_ocr::PlacedWord> =
                 words.iter().map(|word| pdfcraft_ocr::PlacedWord::place(word, |x, y| [f64::from(x) * sx, ph - f64::from(y) * sy])).collect();
             for p in &placed {
                 let text = p.text.to_lowercase();
-                for wanted in self.words.iter().filter(|wanted| text.contains(wanted.as_str())) {
+                for wanted in self.words.iter().filter(|wanted| read_again(&text, wanted)) {
                     let pages = found.entry(wanted.clone()).or_default();
                     if pages.last() != Some(&page) {
                         pages.push(page);
@@ -219,6 +223,35 @@ impl SecureJob {
     }
 }
 
+/// OCR read `wanted` (lower case) again in the word `read` (lower case): the whole of it, or
+/// most of it (OCR misreads and drops letters, and the rest may be under a box): an alphanumeric
+/// run of `read` of at least [`MIN_WORD`] characters and 70 % of `wanted` that `wanted` contains.
+fn read_again(read: &str, wanted: &str) -> bool {
+    if read.contains(wanted) {
+        return true;
+    }
+    let need = (wanted.chars().count() * 7).div_ceil(10).max(MIN_WORD);
+    read.split(|c: char| !c.is_alphanumeric()).any(|part| part.chars().count() >= need && wanted.contains(part))
+}
+
+/// The resolution OCR reads a page at: enough for text of 6 pt and up, and far less memory and
+/// time than the picture's own resolution (OCR of a 300 dpi page took ten times as long and
+/// several GB).
+const OCR_DPI: f32 = 200.0;
+
+/// The page picture (`w` × `h`, rendered at `scale` pixels per point) at [`OCR_DPI`]: a smaller
+/// copy and its size, or `None` and the picture's own size when it is no larger.
+fn for_ocr(rgba: &[u8], w: u32, h: u32, scale: f32) -> (Option<Vec<u8>>, u32, u32) {
+    let k = OCR_DPI / 72.0 / scale.max(1e-3);
+    if !(k.is_finite() && k < 0.95) {
+        return (None, w, h);
+    }
+    let (ow, oh) = (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1));
+    let Some(img) = image::RgbaImage::from_raw(w, h, rgba.to_vec()) else { return (None, w, h) };
+    let small = image::imageops::resize(&img, ow, oh, image::imageops::FilterType::Triangle);
+    (Some(small.into_raw()), ow, oh)
+}
+
 /// The scale (device pixels per point) `info`'s page renders at for `dpi`.
 fn render_scale(info: &PageInfo, dpi: f32) -> f32 {
     let dpi = if dpi.is_finite() { dpi.clamp(72.0, 600.0) } else { DEFAULT_DPI };
@@ -238,19 +271,16 @@ fn prepare(job: &SecureJob) -> Result<(Vec<u8>, Vec<u8>), SecureError> {
         let info = job.infos.get(index);
         let marks: Vec<&Mark> = job.marks.iter().filter(|m| m.page == index).collect();
         let content = match info {
-            Some(info) if !marks.is_empty() => {
-                let user_unit = page.dict.get(b"UserUnit").and_then(Object::as_f64).filter(|u| u.is_finite() && *u > 0.0).unwrap_or(1.0);
-                // GROW_PX device pixels in user space: points are scale pixels, a user unit is
-                // `user_unit` points.
-                let grow = f64::from(GROW_PX) / (f64::from(render_scale(info, job.options.dpi)) * user_unit);
-                Some(mask_content(&marks, grow)?)
-            }
+            Some(info) if !marks.is_empty() => Some(mask_content(&marks, grow_units(&page, &mask, render_scale(info, job.options.dpi)))?),
             _ => None,
         };
         let stream = content.map(|c| mask.add(Object::Stream(Stream::flate(Dict::new(), &c))));
         mask.update_dict(page.obj, |d| {
             d.remove(b"Annots");
             d.remove(b"Group");
+            // Empty resources of its own, so nothing inherited (a /DefaultRGB colour space, say)
+            // changes how the rectangles paint.
+            d.set(b"Resources".to_vec(), Object::Dict(Dict::new()));
             match stream {
                 Some(s) => d.set(b"Contents".to_vec(), Object::Ref(s)),
                 None => {
@@ -262,6 +292,13 @@ fn prepare(job: &SecureJob) -> Result<(Vec<u8>, Vec<u8>), SecureError> {
     }
     let mask = write_incremental(&mask, &SaveOptions::default()).map_err(err)?;
     Ok((printed, mask))
+}
+
+/// [`GROW_PX`] device pixels in `page`'s user space at `scale` pixels per point. A user unit is
+/// as many points as the renderer takes it to be (`/UserUnit`, clamped as it clamps it), not the
+/// raw entry: a huge raw unit would make the growth nothing.
+fn grow_units(page: &pdfcraft_model::Page, doc: &pdfcraft_cos::Document, scale: f32) -> f64 {
+    f64::from(GROW_PX) / (f64::from(scale.max(1e-6)) * page.user_unit(doc))
 }
 
 /// A content stream filling each mark's rectangles, grown by `grow` user units, in its fill
@@ -277,7 +314,9 @@ fn mask_content(marks: &[&Mark], grow: f64) -> Result<Vec<u8>, SecureError> {
             if ![x, y, w, h].iter().all(|v| v.is_finite()) {
                 return Err(SecureError::UnreadableMark(1));
             }
-            c.extend_from_slice(format!("{x:.6} {y:.6} {w:.6} {h:.6} re f\n").as_bytes());
+            // Rust writes an f64 in full and never in exponent form, which PDF numbers can't use:
+            // no rounding moves an edge.
+            c.extend_from_slice(format!("{x} {y} {w} {h} re f\n").as_bytes());
         }
     }
     Ok(c)
@@ -485,13 +524,12 @@ impl Session {
         let cos = guard(|| pdfcraft_cos::Document::open_with_password(src.bytes.clone(), src.config.password.as_deref()))
             .map_err(EditError::Invalid)?
             .map_err(|e| EditError::Invalid(e.to_string()))?;
-        let marks = guard(|| pdfcraft_redact::marks(&cos)).map_err(EditError::Invalid)?;
-        let listed = doc.redaction_marks();
-        if marks.is_empty() && listed == 0 {
-            return Err(SecureError::NoMarks.into());
+        let (marks, unreadable) = guard(|| pdfcraft_redact::marks_checked(&cos)).map_err(EditError::Invalid)?;
+        if !unreadable.is_empty() {
+            return Err(SecureError::UnreadableMark(unreadable.len()).into());
         }
-        if marks.len() < listed {
-            return Err(SecureError::UnreadableMark(listed - marks.len()).into());
+        if marks.is_empty() {
+            return Err(SecureError::NoMarks.into());
         }
         let overlays = marks.iter().filter(|m| !m.overlay.is_empty()).count();
         if overlays > 0 {

@@ -183,7 +183,7 @@ pub fn marks(doc: &Document) -> Vec<Mark> {
 
 /// [`marks`], and the 0-based page of each Redact annotation that has no readable area, which
 /// [`apply`] refuses rather than skipping.
-pub(crate) fn marks_checked(doc: &Document) -> (Vec<Mark>, Vec<usize>) {
+pub fn marks_checked(doc: &Document) -> (Vec<Mark>, Vec<usize>) {
     let (mut out, mut unreadable) = (Vec::new(), Vec::new());
     for (pi, p) in pdfcraft_model::pages(doc).iter().enumerate() {
         for a in annots_of(doc, &p.dict) {
