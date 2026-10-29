@@ -1,0 +1,566 @@
+//! Secure redacted copy: the redaction that cannot leave hidden data behind, because nothing
+//! from the source document reaches the output except pixels.
+//!
+//! Applying redactions in place ([`pdfcraft_redact::apply`]) removes what the content
+//! interpreter finds under each mark, then cleans every other place a copy of the text can be
+//! (metadata, tags, patterns, layers …). A place nobody thought of stays. A secure copy instead:
+//!
+//! 1. renders every page the way it prints (page content and form fields, no comments), with
+//!    the reading colours off;
+//! 2. renders a second, mask page per marked page: the same page boxes, `/Rotate` and
+//!    `/UserUnit`, drawing nothing but the marks' rectangles (grown by [`GROW_PX`] device
+//!    pixels for anti-aliased edges). The renderer places both, so a box covers exactly what
+//!    the page drew there, whatever the page's geometry;
+//! 3. paints every pixel the mask covers in the mark's fill colour (white for a mark with none);
+//! 4. writes a new document holding one image per page, each page the displayed size of its
+//!    source page, with an invisible OCR text layer read from those pixels when OCR is installed;
+//! 5. reads that document back and refuses it unless it holds only what this module writes
+//!    ([`check`]): no `/Info`, no metadata, outline, annotations, forms, structure or layers,
+//!    one revision, no object a page does not use.
+//!
+//! The source document and its marks stay as they were. What a secure copy cannot do is find
+//! what nobody marked: a word left unmarked stays on the page as pixels, and OCR reads it again.
+//! [`SecureReport::still_found`] lists the marked words that OCR found again elsewhere.
+
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
+
+use pdfcraft_cos::{Dict, ObjRef, Object, SaveOptions, Stream, write_full, write_incremental};
+use pdfcraft_print::Content;
+use pdfcraft_redact::Mark;
+use pdfcraft_render::{PRINT_TAG, PageInfo, PageRenderer, RenderConfig, RenderRequest, RequestKind};
+
+use crate::{DocId, EditError, Session, guard};
+
+/// Device pixels each mark grows by on every side, so the anti-aliased edge of a glyph next to
+/// the box is covered too.
+pub const GROW_PX: f32 = 2.0;
+/// The resolution pages are rendered at unless asked otherwise.
+pub const DEFAULT_DPI: f32 = 300.0;
+/// The largest output a secure copy may build (compressed image data and text layers). A
+/// document past it fails with [`SecureError::TooLarge`] instead of exhausting memory.
+pub const MAX_OUTPUT_BYTES: usize = 1 << 30;
+/// Marked words shorter than this are not looked for again in the output (they match
+/// everywhere).
+const MIN_WORD: usize = 4;
+
+/// How to make a secure copy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SecureOptions {
+    /// Render resolution, clamped to 72–600. Large pages render at less (the renderer's caps).
+    pub dpi: f32,
+    /// Add an invisible OCR text layer, when OCR is installed.
+    pub ocr: bool,
+}
+
+impl Default for SecureOptions {
+    fn default() -> Self {
+        Self { dpi: DEFAULT_DPI, ocr: true }
+    }
+}
+
+/// Why a secure copy was not made. Nothing is produced when any of these happens.
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
+pub enum SecureError {
+    #[error("there are no redaction marks to apply")]
+    NoMarks,
+    #[error(
+        "{0} redaction mark(s) have no readable area, so what they cover can't be known; nothing was made. Remove those marks or mark the content again"
+    )]
+    UnreadableMark(usize),
+    #[error(
+        "a secure redacted copy can't draw overlay text yet ({0} mark(s) have it); remove the overlay text from the marks, or apply the redactions in the document"
+    )]
+    OverlayText(usize),
+    #[error("page {page} could not be rendered, so it can't be redacted safely: {reason}")]
+    Render { page: usize, reason: String },
+    #[error("the secure copy would be larger than {} MiB; redact fewer pages at once or choose a lower resolution", MAX_OUTPUT_BYTES >> 20)]
+    TooLarge,
+    #[error("the secure copy failed its own check, so it was not made: {0}")]
+    Check(String),
+    #[error("the secure copy could not be made: {0}")]
+    Internal(String),
+    #[error("stopped")]
+    Cancelled,
+}
+
+/// One page of a secure copy.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SecurePage {
+    /// The resolution the page was rendered at (less than asked for a very large page).
+    pub dpi: f32,
+    pub marks: usize,
+    /// Words in the page's new OCR text layer.
+    pub words: usize,
+    /// The renderer stopped reading the page's content early (its content budget), so some of
+    /// it is not in the picture.
+    pub truncated: bool,
+}
+
+/// A marked word that OCR read again in the secure copy: most likely the same text unmarked
+/// elsewhere. OCR can misread, so this is a prompt to look, not proof.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StillFound {
+    pub text: String,
+    /// 0-based pages of the copy it was read on.
+    pub pages: Vec<usize>,
+}
+
+/// What a secure copy holds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SecureReport {
+    pub pages: Vec<SecurePage>,
+    pub marks: usize,
+    /// The copy has an OCR text layer (OCR was asked for and is installed).
+    pub searchable: bool,
+    pub still_found: Vec<StillFound>,
+    pub bytes: usize,
+}
+
+/// A finished secure copy.
+pub struct SecureCopy {
+    pub bytes: Vec<u8>,
+    pub report: SecureReport,
+}
+
+/// Everything a secure copy needs from a document, detached from the session so it can run on
+/// a worker thread.
+pub struct SecureJob {
+    bytes: Arc<Vec<u8>>,
+    config: RenderConfig,
+    infos: Vec<PageInfo>,
+    marks: Vec<Mark>,
+    /// The marked words to look for again in the output, lower case.
+    words: Vec<String>,
+    pub options: SecureOptions,
+    /// The name the copy opens under.
+    pub name: String,
+}
+
+impl SecureJob {
+    /// Pages to render, for progress.
+    pub fn pages(&self) -> usize {
+        self.infos.len()
+    }
+
+    /// Make the copy. `ocr` reads the text layer (`None`: no text layer). `progress(done,
+    /// total)` is called before each page; returning `false` stops with [`SecureError::Cancelled`].
+    pub fn run(self, ocr: Option<&pdfcraft_ocr::Ocr>, mut progress: impl FnMut(usize, usize) -> bool) -> Result<SecureCopy, SecureError> {
+        let total = self.infos.len();
+        let (printed, mask) = guard(|| prepare(&self)).map_err(SecureError::Internal)??;
+        let config = RenderConfig { transparent: false, hide_comments: false, ..self.config.clone() };
+        let mut page_r = PageRenderer::new(Arc::new(printed), config.clone());
+        let mut mask_r = PageRenderer::new(Arc::new(mask), RenderConfig { transparent: true, layers: Arc::default(), ..config });
+        let mut out = pdfcraft_cos::Document::new_empty();
+        let pages_ref = page_tree(&out)?;
+        let mut kids = Vec::with_capacity(total);
+        let mut report =
+            SecureReport { pages: Vec::with_capacity(total), marks: self.marks.len(), searchable: ocr.is_some(), still_found: Vec::new(), bytes: 0 };
+        let mut found: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        let mut size = 0usize;
+        for (page, info) in self.infos.iter().enumerate() {
+            if !progress(page, total) {
+                return Err(SecureError::Cancelled);
+            }
+            let scale = render_scale(info, self.options.dpi);
+            let shot = page_r.render(RenderRequest { page, scale, tag: PRINT_TAG, ..Default::default() });
+            if let Some(reason) = shot.error {
+                return Err(SecureError::Render { page: page + 1, reason });
+            }
+            let (w, h) = (shot.width, shot.height);
+            let mut rgba = shot.rgba.to_vec();
+            crate::print_raster::over_white(&mut rgba, false);
+            let marks = self.marks.iter().filter(|m| m.page == page).count();
+            if marks > 0 {
+                let m = mask_r.render(RenderRequest { page, scale, tag: PRINT_TAG, ..Default::default() });
+                if let Some(reason) = m.error {
+                    return Err(SecureError::Render { page: page + 1, reason });
+                }
+                if (m.width, m.height) != (w, h) {
+                    return Err(SecureError::Render { page: page + 1, reason: "the marks rendered at a different size than the page".into() });
+                }
+                paint(&mut rgba, &m.rgba);
+            }
+            let words = match ocr {
+                Some(o) => o.recognize(&rgba, w, h).map_err(|e| SecureError::Internal(e.to_string()))?.into_iter().flat_map(|l| l.words).collect(),
+                None => Vec::new(),
+            };
+            let (pw, ph) = (f64::from(info.width), f64::from(info.height));
+            let (sx, sy) = (pw / f64::from(w.max(1)), ph / f64::from(h.max(1)));
+            let placed: Vec<pdfcraft_ocr::PlacedWord> =
+                words.iter().map(|word| pdfcraft_ocr::PlacedWord::place(word, |x, y| [f64::from(x) * sx, ph - f64::from(y) * sy])).collect();
+            for p in &placed {
+                let text = p.text.to_lowercase();
+                for wanted in self.words.iter().filter(|wanted| text.contains(wanted.as_str())) {
+                    let pages = found.entry(wanted.clone()).or_default();
+                    if pages.last() != Some(&page) {
+                        pages.push(page);
+                    }
+                }
+            }
+            let kid = add_page(&mut out, pages_ref, pw, ph, w, h, &rgba, &placed, &mut size)?;
+            kids.push(Object::Ref(kid));
+            report.pages.push(SecurePage { dpi: scale * 72.0, marks, words: placed.len(), truncated: !shot.warnings.is_empty() });
+        }
+        progress(total, total);
+        let count = kids.len() as i64;
+        out.update_dict(pages_ref, |d| {
+            d.set(b"Kids".to_vec(), Object::Array(kids));
+            d.set(b"Count".to_vec(), Object::Int(count));
+        })
+        .map_err(|e| SecureError::Internal(e.to_string()))?;
+        let bytes = guard(|| write_full(&out, &SaveOptions { object_streams: false, ..SaveOptions::default() }))
+            .map_err(SecureError::Internal)?
+            .map_err(|e| SecureError::Internal(e.to_string()))?;
+        guard(|| check(&bytes)).map_err(SecureError::Internal)?.map_err(SecureError::Check)?;
+        report.still_found = found.into_iter().map(|(text, pages)| StillFound { text, pages }).collect();
+        report.bytes = bytes.len();
+        Ok(SecureCopy { bytes, report })
+    }
+}
+
+/// The scale (device pixels per point) `info`'s page renders at for `dpi`.
+fn render_scale(info: &PageInfo, dpi: f32) -> f32 {
+    let dpi = if dpi.is_finite() { dpi.clamp(72.0, 600.0) } else { DEFAULT_DPI };
+    pdfcraft_render::effective_scale(info.width, info.height, dpi / 72.0)
+}
+
+/// The two documents to render: the source as it prints, and the same pages drawing only the
+/// marks' rectangles (unmarked pages draw nothing there).
+fn prepare(job: &SecureJob) -> Result<(Vec<u8>, Vec<u8>), SecureError> {
+    let err = |e: pdfcraft_cos::CosError| SecureError::Internal(e.to_string());
+    let password = job.config.password.as_deref();
+    let mut cos = pdfcraft_cos::Document::open_with_password(job.bytes.clone(), password).map_err(err)?;
+    pdfcraft_print::keep_printed(&mut cos, Content::Document);
+    let printed = write_incremental(&cos, &SaveOptions::default()).map_err(err)?;
+    let mut mask = pdfcraft_cos::Document::open_with_password(job.bytes.clone(), password).map_err(err)?;
+    for (index, page) in pdfcraft_model::pages(&mask).into_iter().enumerate() {
+        let info = job.infos.get(index);
+        let marks: Vec<&Mark> = job.marks.iter().filter(|m| m.page == index).collect();
+        let content = match info {
+            Some(info) if !marks.is_empty() => {
+                let user_unit = page.dict.get(b"UserUnit").and_then(Object::as_f64).filter(|u| u.is_finite() && *u > 0.0).unwrap_or(1.0);
+                // GROW_PX device pixels in user space: points are scale pixels, a user unit is
+                // `user_unit` points.
+                let grow = f64::from(GROW_PX) / (f64::from(render_scale(info, job.options.dpi)) * user_unit);
+                Some(mask_content(&marks, grow)?)
+            }
+            _ => None,
+        };
+        let stream = content.map(|c| mask.add(Object::Stream(Stream::flate(Dict::new(), &c))));
+        mask.update_dict(page.obj, |d| {
+            d.remove(b"Annots");
+            d.remove(b"Group");
+            match stream {
+                Some(s) => d.set(b"Contents".to_vec(), Object::Ref(s)),
+                None => {
+                    d.remove(b"Contents");
+                }
+            }
+        })
+        .map_err(err)?;
+    }
+    let mask = write_incremental(&mask, &SaveOptions::default()).map_err(err)?;
+    Ok((printed, mask))
+}
+
+/// A content stream filling each mark's rectangles, grown by `grow` user units, in its fill
+/// colour (white when it has none: what is removed shows the paper).
+fn mask_content(marks: &[&Mark], grow: f64) -> Result<Vec<u8>, SecureError> {
+    let mut c = Vec::new();
+    for m in marks {
+        let [r, g, b] = m.fill.unwrap_or([1.0; 3]).map(|v| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 });
+        c.extend_from_slice(format!("{r:.4} {g:.4} {b:.4} rg\n").as_bytes());
+        for rect in &m.rects {
+            let [x0, y0, x1, y1] = *rect;
+            let (x, y, w, h) = (x0 - grow, y0 - grow, x1 - x0 + 2.0 * grow, y1 - y0 + 2.0 * grow);
+            if ![x, y, w, h].iter().all(|v| v.is_finite()) {
+                return Err(SecureError::UnreadableMark(1));
+            }
+            c.extend_from_slice(format!("{x:.6} {y:.6} {w:.6} {h:.6} re f\n").as_bytes());
+        }
+    }
+    Ok(c)
+}
+
+/// Paint every pixel the mask raster covers, in the mask's colour, fully opaque. `mask` is
+/// premultiplied RGBA of the same size as `page` (opaque RGBA).
+fn paint(page: &mut [u8], mask: &[u8]) {
+    for (px, m) in page.as_chunks_mut::<4>().0.iter_mut().zip(mask.as_chunks::<4>().0) {
+        let a = u32::from(m[3]);
+        if a == 0 {
+            continue;
+        }
+        // Un-premultiply: a partly covered edge pixel still gets the mark's full colour.
+        let c = |v: u8| ((u32::from(v) * 255 + a / 2) / a).min(255) as u8;
+        *px = [c(m[0]), c(m[1]), c(m[2]), 255];
+    }
+}
+
+fn page_tree(doc: &pdfcraft_cos::Document) -> Result<ObjRef, SecureError> {
+    doc.root()
+        .and_then(|r| doc.get(r).as_dict().and_then(|d| d.reference(b"Pages")))
+        .ok_or_else(|| SecureError::Internal("the new document has no page tree".into()))
+}
+
+/// Add one image page of `pw` × `ph` points showing `rgba` (`w` × `h`, opaque), with `words` as
+/// its invisible text layer.
+#[allow(clippy::too_many_arguments)]
+fn add_page(
+    doc: &mut pdfcraft_cos::Document,
+    parent: ObjRef,
+    pw: f64,
+    ph: f64,
+    w: u32,
+    h: u32,
+    rgba: &[u8],
+    words: &[pdfcraft_ocr::PlacedWord],
+    size: &mut usize,
+) -> Result<ObjRef, SecureError> {
+    let mut rgb = Vec::new();
+    rgb.try_reserve_exact(rgba.len() / 4 * 3).map_err(|_| SecureError::TooLarge)?;
+    for px in rgba.as_chunks::<4>().0 {
+        rgb.extend_from_slice(&px[..3]);
+    }
+    let mut image = Dict::new();
+    image.set(b"Type".to_vec(), Object::name("XObject"));
+    image.set(b"Subtype".to_vec(), Object::name("Image"));
+    image.set(b"Width".to_vec(), Object::Int(i64::from(w)));
+    image.set(b"Height".to_vec(), Object::Int(i64::from(h)));
+    image.set(b"ColorSpace".to_vec(), Object::name("DeviceRGB"));
+    image.set(b"BitsPerComponent".to_vec(), Object::Int(8));
+    let image = Stream::flate(image, &rgb);
+    drop(rgb);
+    let mut content = format!("q {pw:.4} 0 0 {ph:.4} 0 0 cm /Im0 Do Q\n").into_bytes();
+    if !words.is_empty() {
+        content.extend(pdfcraft_ocr::text_layer(words));
+    }
+    let content = Stream::flate(Dict::new(), &content);
+    *size = size.saturating_add(image.raw.len()).saturating_add(content.raw.len());
+    if *size > MAX_OUTPUT_BYTES {
+        return Err(SecureError::TooLarge);
+    }
+    let image = doc.add(Object::Stream(image));
+    let content = doc.add(Object::Stream(content));
+    let mut xobjects = Dict::new();
+    xobjects.set(b"Im0".to_vec(), Object::Ref(image));
+    let mut resources = Dict::new();
+    resources.set(b"XObject".to_vec(), Object::Dict(xobjects));
+    if !words.is_empty() {
+        let mut helv = Dict::new();
+        helv.set(b"Type".to_vec(), Object::name("Font"));
+        helv.set(b"Subtype".to_vec(), Object::name("Type1"));
+        helv.set(b"BaseFont".to_vec(), Object::name("Helvetica"));
+        helv.set(b"Encoding".to_vec(), Object::name("WinAnsiEncoding"));
+        let mut fonts = Dict::new();
+        fonts.set(b"PCHelv".to_vec(), Object::Dict(helv));
+        resources.set(b"Font".to_vec(), Object::Dict(fonts));
+    }
+    let mut page = Dict::new();
+    page.set(b"Type".to_vec(), Object::name("Page"));
+    page.set(b"Parent".to_vec(), Object::Ref(parent));
+    page.set(b"MediaBox".to_vec(), Object::Array(vec![0.into(), 0.into(), Object::Real(pw), Object::Real(ph)]));
+    page.set(b"Resources".to_vec(), Object::Dict(resources));
+    page.set(b"Contents".to_vec(), Object::Ref(content));
+    Ok(doc.add(page))
+}
+
+/// Keys each kind of object in a secure copy may have.
+const TRAILER: &[&[u8]] = &[b"Root", b"Size", b"ID"];
+const CATALOG: &[&[u8]] = &[b"Type", b"Pages"];
+const PAGES: &[&[u8]] = &[b"Type", b"Kids", b"Count"];
+const PAGE: &[&[u8]] = &[b"Type", b"Parent", b"MediaBox", b"Resources", b"Contents"];
+const RESOURCES: &[&[u8]] = &[b"XObject", b"Font"];
+const IMAGE: &[&[u8]] = &[b"Type", b"Subtype", b"Width", b"Height", b"ColorSpace", b"BitsPerComponent", b"Filter", b"Length"];
+const CONTENT: &[&[u8]] = &[b"Filter", b"Length"];
+const FONT: &[&[u8]] = &[b"Type", b"Subtype", b"BaseFont", b"Encoding"];
+
+/// Read `bytes` back and accept them only if they hold exactly what [`SecureJob::run`] writes:
+/// a catalog, one page tree, image pages with one image each and an optional standard
+/// Helvetica text layer, in one revision, with no object that a page doesn't use. Any other
+/// key or object is reported by name.
+pub fn check(bytes: &[u8]) -> Result<(), String> {
+    let doc = pdfcraft_cos::Document::open(Arc::new(bytes.to_vec())).map_err(|e| format!("it can't be read back: {e}"))?;
+    if doc.revisions().len() != 1 || bytes.windows(5).filter(|w| *w == b"%%EOF").count() != 1 {
+        return Err("it has more than one revision".into());
+    }
+    if doc.security().is_some() {
+        return Err("it is encrypted".into());
+    }
+    let only = |what: &str, d: &Dict, allowed: &[&[u8]]| -> Result<(), String> {
+        match d.iter().find(|(k, _)| !allowed.contains(&k.as_ref())) {
+            Some((k, _)) => Err(format!("its {what} has /{}", String::from_utf8_lossy(k.as_ref()))),
+            None => Ok(()),
+        }
+    };
+    let name_is = |d: &Dict, key: &[u8], want: &[u8]| d.name(key) == Some(want);
+    only("trailer", doc.trailer(), TRAILER)?;
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut take = |r: ObjRef, what: &str| -> Result<Arc<Object>, String> {
+        if !seen.insert(r.num) {
+            return Err(format!("its {what} (object {}) is used twice", r.num));
+        }
+        doc.try_get(r.num).map_err(|e| format!("its {what} (object {}) can't be read: {e}", r.num))
+    };
+    let root = doc.root().ok_or("it has no catalog")?;
+    let catalog = take(root, "catalog")?;
+    let catalog = dict_of(&catalog).ok_or("its catalog is not a dictionary")?;
+    only("catalog", catalog, CATALOG)?;
+    let pages_ref = catalog.reference(b"Pages").ok_or("its catalog has no page tree")?;
+    let pages = take(pages_ref, "page tree")?;
+    let pages = dict_of(&pages).ok_or("its page tree is not a dictionary")?;
+    only("page tree", pages, PAGES)?;
+    let kids = pages.get(b"Kids").and_then(Object::as_array).ok_or("its page tree has no pages")?;
+    for kid in kids {
+        let r = kid.as_ref().ok_or("a page is not an indirect object")?;
+        let page = take(r, "page")?;
+        let page = dict_of(&page).ok_or("a page is not a dictionary")?;
+        only("page", page, PAGE)?;
+        if !name_is(page, b"Type", b"Page") || page.reference(b"Parent") != Some(pages_ref) {
+            return Err(format!("object {} is not a page of the page tree", r.num));
+        }
+        let content_ref = page.reference(b"Contents").ok_or("a page has no content stream")?;
+        let content = take(content_ref, "page content")?;
+        let content = stream_of(&content).ok_or("a page's content is not a stream")?;
+        only("page content", &content.dict, CONTENT)?;
+        let res = page.get(b"Resources").and_then(dict_of).ok_or("a page has no resources")?;
+        only("page resources", res, RESOURCES)?;
+        let xobjects = res.get(b"XObject").and_then(dict_of).ok_or("a page has no image")?;
+        if xobjects.len() != 1 {
+            return Err("a page has more than one XObject".into());
+        }
+        for (_, x) in xobjects.iter() {
+            let r = x.as_ref().ok_or("a page's image is not an indirect object")?;
+            let image = take(r, "image")?;
+            let image = stream_of(&image).ok_or("a page's XObject is not a stream")?;
+            only("image", &image.dict, IMAGE)?;
+            if !name_is(&image.dict, b"Subtype", b"Image") || !name_is(&image.dict, b"ColorSpace", b"DeviceRGB") {
+                return Err(format!("object {} is not an RGB image", r.num));
+            }
+        }
+        if let Some(fonts) = res.get(b"Font") {
+            let fonts = dict_of(fonts).ok_or("a page's fonts are not a dictionary")?;
+            for (_, f) in fonts.iter() {
+                let f = dict_of(f).ok_or("a font is not a direct dictionary")?;
+                only("font", f, FONT)?;
+                if !name_is(f, b"BaseFont", b"Helvetica") || !name_is(f, b"Subtype", b"Type1") || !name_is(f, b"Encoding", b"WinAnsiEncoding") {
+                    return Err("a font is not the standard Helvetica".into());
+                }
+            }
+        }
+    }
+    let extra: Vec<u32> = doc.object_numbers().into_iter().filter(|n| *n != 0 && !seen.contains(n)).collect();
+    if let Some(n) = extra.first() {
+        return Err(format!("object {n} is not used by any page ({} such object(s))", extra.len()));
+    }
+    Ok(())
+}
+
+/// A dictionary that is not a stream's.
+fn dict_of(o: &Object) -> Option<&Dict> {
+    match o {
+        Object::Dict(d) => Some(d),
+        _ => None,
+    }
+}
+
+fn stream_of(o: &Object) -> Option<&Stream> {
+    match o {
+        Object::Stream(s) => Some(s),
+        _ => None,
+    }
+}
+
+impl Session {
+    /// Capture what a secure redacted copy of document `id` needs. Refused when it has no
+    /// marks, a mark without area or with overlay text, or when its security settings don't
+    /// allow redaction (changing it) or copying its text and images.
+    pub fn secure_copy_job(&self, id: DocId, options: SecureOptions) -> Result<SecureJob, EditError> {
+        let doc = self.get(id).ok_or(EditError::NoDocument)?;
+        if let Some(p) = doc.editor.as_ref().and_then(|e| e.cos.permissions()) {
+            crate::edit::check_permission(&crate::Edit::ApplyRedactions { pages: None }, &p)?;
+        }
+        doc.check_copying()?;
+        let src = doc.export_source();
+        let cos = guard(|| pdfcraft_cos::Document::open_with_password(src.bytes.clone(), src.config.password.as_deref()))
+            .map_err(EditError::Invalid)?
+            .map_err(|e| EditError::Invalid(e.to_string()))?;
+        let marks = guard(|| pdfcraft_redact::marks(&cos)).map_err(EditError::Invalid)?;
+        let listed = doc.redaction_marks();
+        if marks.is_empty() && listed == 0 {
+            return Err(SecureError::NoMarks.into());
+        }
+        if marks.len() < listed {
+            return Err(SecureError::UnreadableMark(listed - marks.len()).into());
+        }
+        let overlays = marks.iter().filter(|m| !m.overlay.is_empty()).count();
+        if overlays > 0 {
+            return Err(SecureError::OverlayText(overlays).into());
+        }
+        let infos = doc.info.pages.clone();
+        let words = guard(|| marked_words(&src.bytes, &src.config, &infos, &marks)).map_err(EditError::Invalid)?;
+        let stem = doc.display_name();
+        let stem = stem.strip_suffix(".pdf").or_else(|| stem.strip_suffix(".PDF")).unwrap_or(&stem);
+        Ok(SecureJob { bytes: src.bytes, config: src.config, infos, marks, words, options, name: format!("{stem} (redacted).pdf") })
+    }
+
+    /// Make a secure redacted copy of document `id` and open it as a new, unsaved document.
+    /// The source and its marks stay as they were. Reads text with OCR when `options.ocr` and
+    /// OCR is installed.
+    pub fn secure_redacted_copy(&mut self, id: DocId, options: SecureOptions) -> Result<(DocId, SecureReport), EditError> {
+        let job = self.secure_copy_job(id, options)?;
+        let ocr = if options.ocr && crate::ocr::available() { crate::ocr::engine().ok() } else { None };
+        let name = job.name.clone();
+        let copy = job.run(ocr.as_deref(), |_, _| true)?;
+        let new = self.open_new(name, Arc::new(copy.bytes)).map_err(|e| EditError::Invalid(e.to_string()))?;
+        Ok((new, copy.report))
+    }
+}
+
+/// The words under the marks (lower case, at least [`MIN_WORD`] characters), read from the
+/// page's own text layer.
+fn marked_words(bytes: &Arc<Vec<u8>>, config: &RenderConfig, infos: &[PageInfo], marks: &[Mark]) -> Vec<String> {
+    let mut r = PageRenderer::new(bytes.clone(), config.clone());
+    let mut out: Vec<String> = Vec::new();
+    let mut pages: Vec<usize> = marks.iter().map(|m| m.page).collect();
+    pages.dedup();
+    for page in pages {
+        let (Some(info), Some(text)) =
+            (infos.get(page), r.render(RenderRequest { page, kind: RequestKind::Text, scale: 1.0, ..Default::default() }).text)
+        else {
+            continue;
+        };
+        for m in marks.iter().filter(|m| m.page == page) {
+            for rect in &m.rects {
+                // The text layer is in view space (y down, after /Rotate): map all four corners.
+                let corners = [[rect[0], rect[1]], [rect[2], rect[1]], [rect[0], rect[3]], [rect[2], rect[3]]]
+                    .map(|[x, y]| info.user_to_view(x as f32, y as f32));
+                let xs = corners.map(|c| c[0]);
+                let ys = corners.map(|c| c[1]);
+                let view = [
+                    xs.iter().copied().fold(f32::MAX, f32::min),
+                    ys.iter().copied().fold(f32::MAX, f32::min),
+                    xs.iter().copied().fold(f32::MIN, f32::max),
+                    ys.iter().copied().fold(f32::MIN, f32::max),
+                ];
+                let glyphs = text.glyphs_in(view);
+                for word in text.column_text(&glyphs).split(|c: char| !c.is_alphanumeric()) {
+                    let word = word.to_lowercase();
+                    if word.chars().count() >= MIN_WORD && !out.contains(&word) {
+                        out.push(word);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+impl From<SecureError> for EditError {
+    fn from(e: SecureError) -> Self {
+        EditError::SecureCopy(e)
+    }
+}
+
+#[cfg(test)]
+mod tests;
