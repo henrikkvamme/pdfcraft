@@ -684,3 +684,20 @@ fn every_annotation_entry_is_read() {
     let job = s.secure_copy_job(id, SecureOptions::default());
     assert!(matches!(job, Err(EditError::SecureCopy(SecureError::UnreadableMark(1)))), "{:?}", job.err());
 }
+
+/// A /Rect or /IC longer than four numbers is not read as one: the mark has no area, or no colour
+/// (white), rather than taking whatever the list starts with.
+#[test]
+fn long_rect_and_colour_lists_are_not_read() {
+    let ic: String = (0..10_000).map(|_| "0 ").collect();
+    let file = page("", VISIBLE, "/Annots [6 0 R]", "", &[format!("<< /Type /Annot /Subtype /Redact /Rect [40 190 250 220 9] /IC [{ic}] >>")]);
+    let mut s = Session::new();
+    let id = s.open("t.pdf", None, Arc::new(file), None).unwrap();
+    let job = s.secure_copy_job(id, SecureOptions::default());
+    assert!(matches!(job, Err(EditError::SecureCopy(SecureError::UnreadableMark(1)))), "{:?}", job.err());
+    let file = page("", VISIBLE, "/Annots [6 0 R]", "", &[format!("<< /Type /Annot /Subtype /Redact /Rect [40 190 250 220] /IC [{ic}] >>")]);
+    let id = s.open("u.pdf", None, Arc::new(file), None).unwrap();
+    let out = s.secure_copy_job(id, SecureOptions { dpi: 72.0, ocr: false }).unwrap().run(None, |_, _| true).unwrap();
+    let img = render(&out.bytes, 1.0);
+    assert_eq!(px(&img, 120.0, 95.0), [255, 255, 255, 255], "no colour read: the box is white");
+}

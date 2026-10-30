@@ -318,6 +318,16 @@ fn whole_page_settings(w: f32, h: f32, scale: f32) -> RenderSettings {
     RenderSettings { x_scale: scale, y_scale: scale, width: Some(side(w)), height: Some(side(h)), ..Default::default() }
 }
 
+/// The numbers of a short array (a rectangle, a colour) without reading more than five entries:
+/// all of them when it has at most four and every one is a number, otherwise none.
+fn up_to_four(a: &hayro::hayro_syntax::object::Array<'_>) -> Vec<f64> {
+    if a.raw_iter().take(5).count() > 4 {
+        return Vec::new();
+    }
+    let numbers: Vec<f64> = a.iter::<f64>().take(4).collect();
+    if numbers.len() == a.raw_iter().take(5).count() { numbers } else { Vec::new() }
+}
+
 /// What [`PageRenderer::page_redactions`] found on a page.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PageRedactions {
@@ -587,7 +597,7 @@ impl PageRenderer {
                     continue;
                 }
                 if rects.is_empty() {
-                    let rect: Vec<f64> = annot.get::<Array<'_>>(b"Rect").map(|a| a.iter::<f64>().collect()).unwrap_or_default();
+                    let rect = annot.get::<Array<'_>>(b"Rect").map(|a| up_to_four(&a)).unwrap_or_default();
                     if let [a, b, c, d] = rect[..] {
                         let r = [a.min(c), b.min(d), a.max(c), b.max(d)];
                         if finite(&r) {
@@ -604,7 +614,7 @@ impl PageRenderer {
                     out.unreadable += 1;
                     continue;
                 }
-                let ic: Vec<f64> = annot.get::<Array<'_>>(b"IC").map(|a| a.iter::<f64>().collect()).unwrap_or_default();
+                let ic = annot.get::<Array<'_>>(b"IC").map(|a| up_to_four(&a)).unwrap_or_default();
                 let fill = match ic[..] {
                     [g] => Some([g; 3]),
                     [r, g, b] => Some([r, g, b]),
