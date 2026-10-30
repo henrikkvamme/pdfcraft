@@ -31,7 +31,7 @@ use std::sync::Arc;
 use pdfcraft_cos::{Dict, ObjRef, Object, SaveOptions, Stream, write_full, write_incremental};
 use pdfcraft_print::Content;
 use pdfcraft_redact::Mark;
-use pdfcraft_render::{PRINT_TAG, PageGeometry, PageInfo, PageRenderer, RenderConfig, RenderRequest, RequestKind};
+use pdfcraft_render::{PRINT_TAG, PageGeometry, PageRenderer, RenderConfig, RenderRequest, RequestKind};
 
 use crate::{DocId, EditError, Session, guard};
 
@@ -490,41 +490,46 @@ impl Session {
         let cos = guard(|| pdfcraft_cos::Document::open_with_password(src.bytes.clone(), src.config.password.as_deref()))
             .map_err(EditError::Invalid)?
             .map_err(|e| EditError::Invalid(e.to_string()))?;
-        let (marks, unreadable) = guard(|| pdfcraft_redact::marks_checked(&cos)).map_err(EditError::Invalid)?;
-        if !unreadable.is_empty() {
-            return Err(SecureError::UnreadableMark(unreadable.len()).into());
-        }
-        if marks.is_empty() {
-            return Err(SecureError::NoMarks.into());
-        }
-        let overlays = marks.iter().filter(|m| !m.overlay.is_empty()).count();
-        if overlays > 0 {
-            return Err(SecureError::OverlayText(overlays).into());
-        }
-        let infos = doc.info.pages.clone();
-        // The pictures are the renderer's pages; each mark goes on every picture of the page object
-        // it is on. A page the renderer has no object number for (a dictionary written in place)
-        // can't be matched, and a marked page it doesn't draw would lose its marks: refused.
+        // The pictures are the renderer's pages, and the marks are read from those same pages:
+        // each page object the renderer draws, its own /Annots. A mark goes on every picture of
+        // its page. A page the renderer has no object number for (a dictionary written in place)
+        // can't be read this way: refused.
         let pages: Vec<Option<u32>> =
             guard(|| PageRenderer::new(src.bytes.clone(), src.config.clone()).page_objects()).map_err(EditError::Invalid)?;
         let pages: Vec<u32> = pages
             .into_iter()
             .collect::<Option<_>>()
             .ok_or_else(|| SecureError::PageTree("a page is written in place, not as an object of its own".into()))?;
-        let walk: Vec<u32> = guard(|| pdfcraft_model::pages(&cos).iter().map(|p| p.obj.num).collect()).map_err(EditError::Invalid)?;
-        let mut on_pages = Vec::with_capacity(marks.len());
-        for m in marks {
-            let object = walk.get(m.page).copied().filter(|o| pages.contains(o));
-            let object = object.ok_or_else(|| {
-                SecureError::PageTree(format!("a mark is on a page (page {} of the page walk) the renderer doesn't draw", m.page + 1))
-            })?;
-            on_pages.push((object, m));
+        let (marks, unreadable) = guard(|| {
+            let (mut marks, mut unreadable) = (Vec::new(), 0usize);
+            let mut seen = HashSet::new();
+            for (index, &object) in pages.iter().enumerate() {
+                if !seen.insert(object) {
+                    continue;
+                }
+                let Ok(page) = cos.try_get(object) else { continue };
+                let Some(page) = page.as_dict() else { continue };
+                let (found, bad) = pdfcraft_redact::page_marks(&cos, index, page);
+                unreadable += bad;
+                marks.extend(found.into_iter().map(|m| (object, m)));
+            }
+            (marks, unreadable)
+        })
+        .map_err(EditError::Invalid)?;
+        if unreadable > 0 {
+            return Err(SecureError::UnreadableMark(unreadable).into());
         }
-        let plain: Vec<Mark> = on_pages.iter().map(|(_, m)| m.clone()).collect();
-        let words = guard(|| marked_words(&src.bytes, &src.config, &infos, &plain)).map_err(EditError::Invalid)?;
+        if marks.is_empty() {
+            return Err(SecureError::NoMarks.into());
+        }
+        let overlays = marks.iter().filter(|(_, m)| !m.overlay.is_empty()).count();
+        if overlays > 0 {
+            return Err(SecureError::OverlayText(overlays).into());
+        }
+        let words = guard(|| marked_words(&src.bytes, &src.config, &marks)).map_err(EditError::Invalid)?;
         let stem = doc.display_name();
         let stem = stem.strip_suffix(".pdf").or_else(|| stem.strip_suffix(".PDF")).unwrap_or(&stem);
-        Ok(SecureJob { bytes: src.bytes, config: src.config, pages, marks: on_pages, words, options, name: format!("{stem} (redacted).pdf") })
+        Ok(SecureJob { bytes: src.bytes, config: src.config, pages, marks, words, options, name: format!("{stem} (redacted).pdf") })
     }
 
     /// Make a secure redacted copy of document `id` and open it as a new, unsaved document.
@@ -542,31 +547,27 @@ impl Session {
 
 /// The words under the marks (lower case, at least [`MIN_WORD`] characters), read from the
 /// page's own text layer.
-fn marked_words(bytes: &Arc<Vec<u8>>, config: &RenderConfig, infos: &[PageInfo], marks: &[Mark]) -> Vec<String> {
+fn marked_words(bytes: &Arc<Vec<u8>>, config: &RenderConfig, marks: &[(u32, Mark)]) -> Vec<String> {
     let mut r = PageRenderer::new(bytes.clone(), config.clone());
     let mut out: Vec<String> = Vec::new();
-    let mut pages: Vec<usize> = marks.iter().map(|m| m.page).collect();
+    let mut pages: Vec<usize> = marks.iter().map(|(_, m)| m.page).collect();
+    pages.sort_unstable();
     pages.dedup();
     for page in pages {
-        let (Some(info), Some(text)) =
-            (infos.get(page), r.render(RenderRequest { page, kind: RequestKind::Text, scale: 1.0, ..Default::default() }).text)
+        // The text layer is in view space: points, y down, after /Rotate, which is the renderer's
+        // raster at scale 1.
+        let (Some(view), Some(text)) =
+            (r.page_geometry(page, 1.0), r.render(RenderRequest { page, kind: RequestKind::Text, scale: 1.0, ..Default::default() }).text)
         else {
             continue;
         };
-        for m in marks.iter().filter(|m| m.page == page) {
+        let k = f64::from(view.scale.max(1e-6));
+        for (_, m) in marks.iter().filter(|(_, m)| m.page == page) {
             for rect in &m.rects {
-                // The text layer is in view space (y down, after /Rotate): map all four corners.
-                let corners = [[rect[0], rect[1]], [rect[2], rect[1]], [rect[0], rect[3]], [rect[2], rect[3]]]
-                    .map(|[x, y]| info.user_to_view(x as f32, y as f32));
-                let xs = corners.map(|c| c[0]);
-                let ys = corners.map(|c| c[1]);
-                let view = [
-                    xs.iter().copied().fold(f32::MAX, f32::min),
-                    ys.iter().copied().fold(f32::MAX, f32::min),
-                    xs.iter().copied().fold(f32::MIN, f32::max),
-                    ys.iter().copied().fold(f32::MIN, f32::max),
-                ];
-                let glyphs = text.glyphs_in(view);
+                let corners = [[rect[0], rect[1]], [rect[2], rect[1]], [rect[0], rect[3]], [rect[2], rect[3]]].map(|[x, y]| view.to_device(x, y));
+                let lo = |i: usize| (corners.iter().map(|c| c[i]).fold(f64::MAX, f64::min) / k) as f32;
+                let hi = |i: usize| (corners.iter().map(|c| c[i]).fold(f64::MIN, f64::max) / k) as f32;
+                let glyphs = text.glyphs_in([lo(0), lo(1), hi(0), hi(1)]);
                 for word in text.column_text(&glyphs).split(|c: char| !c.is_alphanumeric()) {
                     let word = word.to_lowercase();
                     if word.chars().count() >= MIN_WORD && !out.contains(&word) {

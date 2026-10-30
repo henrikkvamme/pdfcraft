@@ -709,16 +709,29 @@ impl PdfCraftApp {
                 match result {
                     Ok((bytes, report)) => {
                         self.open_created(&name, std::sync::Arc::new(bytes), "Created a secure redacted copy. Save it to keep it.");
+                        // What to check in the copy, in one message (each would replace the last).
+                        let mut checks: Vec<String> = Vec::new();
+                        let truncated: Vec<String> =
+                            report.pages.iter().enumerate().filter(|(_, p)| p.truncated).map(|(i, _)| (i + 1).to_string()).collect();
+                        if !truncated.is_empty() {
+                            checks.push(crate::i18n::fmt(
+                                tl!("Page {pages} had more content than PdfCraft draws, so some of it is missing from the copy."),
+                                &[("pages", &truncated.join(", "))],
+                            ));
+                        }
                         if !report.still_found.is_empty() {
                             let words: Vec<String> = report.still_found.iter().map(|f| format!("“{}”", f.text)).collect();
                             let mut pages: Vec<usize> = report.still_found.iter().flat_map(|f| f.pages.iter().map(|p| p + 1)).collect();
                             pages.sort_unstable();
                             pages.dedup();
                             let pages: Vec<String> = pages.iter().map(ToString::to_string).collect();
-                            self.notify_fmt(
-                                "Check the copy: OCR read {words} again on page {pages}. If it should go too, mark it in the original and make the copy again.",
+                            checks.push(crate::i18n::fmt(
+                                tl!("OCR read {words} again on page {pages}. If it should go too, mark it in the original and make the copy again."),
                                 &[("words", &words.join(", ")), ("pages", &pages.join(", "))],
-                            );
+                            ));
+                        }
+                        if !checks.is_empty() {
+                            self.notify(format!("{} {}", tl!("Check the copy:"), checks.join(" ")));
                         }
                     }
                     Err(e) => self.notify_fmt("Couldn't make a secure redacted copy: {e}", &[("e", &e)]),

@@ -557,10 +557,46 @@ fn every_picture_of_a_marked_page_gets_its_box() {
     assert!(boxed >= 2, "{boxed} of {pages} pictures have the box");
 }
 
-/// A mark on a page the renderer doesn't draw (here page 5, which the page walk finds under a
-/// node the renderer takes for a page) would be lost: refused.
+/// The marks are read from the pages the renderer draws: object 4 has /Kids but no /Type, so the
+/// renderer draws it as a page while the page walk takes it for a node, and its mark still gets
+/// its box. A mark whose /Subtype is an indirect object counts too.
 #[test]
-fn a_mark_on_a_page_not_drawn_is_refused() {
+fn marks_come_from_the_pages_that_are_drawn() {
+    let body = |word: &str| format!("BT /F1 14 Tf 40 200 Td (Client {word} Holdings) Tj ET");
+    let file = pdf(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 300] >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> >> /Contents 6 0 R /Annots [8 0 R] >>".to_string(),
+            "<< /Kids [11 0 R] /Count 1 /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> >> /Contents 7 0 R /Annots [9 0 R] >>".to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_string(),
+            stream("", &body("FIRST111")),
+            stream("", &body("SECOND22")),
+            "<< /Type /Annot /Subtype 10 0 R /Rect [40 190 250 220] /IC [0 0 0] >>".to_string(),
+            "<< /Type /Annot /Subtype /Redact /Rect [40 190 250 220] /IC [0 0 0] >>".to_string(),
+            "/Redact".to_string(),
+            "<< /Type /Page /Parent 4 0 R >>".to_string(),
+        ],
+        "",
+    );
+    let mut s = Session::new();
+    let id = s.open("drawn.pdf", None, Arc::new(file), None).unwrap();
+    let job = s.secure_copy_job(id, SecureOptions { dpi: 72.0, ocr: false }).unwrap();
+    assert_eq!(job.pages, [3, 4], "the renderer draws objects 3 and 4");
+    let out = job.run(None, |_, _| true).unwrap();
+    assert_eq!(out.report.marks, 2);
+    let mut r = PageRenderer::new(Arc::new(out.bytes), RenderConfig::default());
+    for page in 0..2 {
+        let shot = r.render(RenderRequest { page, scale: 1.0, ..Default::default() });
+        let img = (shot.width, shot.height, shot.rgba.to_vec());
+        let boxed = (82..108).all(|y| (42..248).all(|x| px(&img, x as f32, y as f32)[0] < 60));
+        assert!(boxed, "page {} has no box", page + 1);
+    }
+}
+
+/// A mark on a page the renderer never draws isn't needed: that page isn't in the copy.
+#[test]
+fn a_mark_on_a_page_not_drawn_is_not_needed() {
     let file = pdf(
         &[
             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
@@ -575,5 +611,5 @@ fn a_mark_on_a_page_not_drawn_is_refused() {
     let mut s = Session::new();
     let id = s.open("t.pdf", None, Arc::new(file), None).unwrap();
     let job = s.secure_copy_job(id, SecureOptions::default());
-    assert!(matches!(job, Err(EditError::SecureCopy(SecureError::PageTree(_)))), "{:?}", job.err());
+    assert!(matches!(job, Err(EditError::SecureCopy(SecureError::NoMarks))), "{:?}", job.err());
 }

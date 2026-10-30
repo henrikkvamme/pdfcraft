@@ -186,52 +186,63 @@ pub fn marks(doc: &Document) -> Vec<Mark> {
 pub fn marks_checked(doc: &Document) -> (Vec<Mark>, Vec<usize>) {
     let (mut out, mut unreadable) = (Vec::new(), Vec::new());
     for (pi, p) in pdfcraft_model::pages(doc).iter().enumerate() {
-        for a in annots_of(doc, &p.dict) {
-            let Some(r) = a.as_ref() else {
-                // A mark written in place has no object to find, apply or remove: refuse it
-                // rather than apply the others as if it were not there.
-                if doc.resolve(&a).as_dict().is_some_and(|d| d.name(b"Subtype") == Some(b"Redact")) {
-                    unreadable.push(pi);
-                }
-                continue;
-            };
-            let obj = doc.get(r);
-            let Some(d) = obj.as_dict() else { continue };
-            if d.name(b"Subtype") != Some(b"Redact") {
-                continue;
+        let (marks, bad) = page_marks(doc, pi, &p.dict);
+        out.extend(marks);
+        unreadable.extend(std::iter::repeat_n(pi, bad));
+    }
+    (out, unreadable)
+}
+
+/// The redaction marks of one page (`page`, its dictionary; `index` goes into each [`Mark`]),
+/// and how many Redact annotations on it have no readable area or are written in place, which
+/// [`apply`] refuses rather than skipping. `/Subtype` is resolved, so a mark whose subtype is an
+/// indirect object counts like any other.
+pub fn page_marks(doc: &Document, index: usize, page: &Dict) -> (Vec<Mark>, usize) {
+    let is_redact = |d: &Dict| d.get(b"Subtype").is_some_and(|t| doc.resolve(t).as_name() == Some(b"Redact".as_slice()));
+    let (mut out, mut unreadable) = (Vec::new(), 0usize);
+    for a in annots_of(doc, page) {
+        let Some(r) = a.as_ref() else {
+            // A mark written in place has no object to find, apply or remove: refuse it
+            // rather than apply the others as if it were not there.
+            if doc.resolve(&a).as_dict().is_some_and(is_redact) {
+                unreadable += 1;
             }
-            let quads: Vec<f64> = d
-                .get(b"QuadPoints")
-                .and_then(|q| doc.resolve(q).as_array().map(|a| a.iter().filter_map(Object::as_f64).collect()))
-                .unwrap_or_default();
-            let mut rects: Vec<[f64; 4]> = quads
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .map(|q| {
-                    let xs = [q[0], q[2], q[4], q[6]];
-                    let ys = [q[1], q[3], q[5], q[7]];
-                    [
-                        xs.iter().copied().fold(f64::MAX, f64::min),
-                        ys.iter().copied().fold(f64::MAX, f64::min),
-                        xs.iter().copied().fold(f64::MIN, f64::max),
-                        ys.iter().copied().fold(f64::MIN, f64::max),
-                    ]
-                })
-                .filter(|r| r.iter().all(|v| v.is_finite()))
-                .collect();
-            if rects.is_empty()
-                && let Some(r) = rect_of(doc, d.get(b"Rect"))
-            {
-                rects.push(r);
-            }
-            if rects.is_empty() {
-                unreadable.push(pi);
-                continue;
-            }
-            let overlay = d.get(b"OverlayText").and_then(|t| doc.resolve(t).as_string().map(|s| s.to_text())).unwrap_or_default();
-            out.push(Mark { page: pi, obj: r, rects, fill: color(doc, d, b"IC"), overlay, look: overlay_look(doc, d) });
+            continue;
+        };
+        let obj = doc.get(r);
+        let Some(d) = obj.as_dict() else { continue };
+        if !is_redact(d) {
+            continue;
         }
+        let quads: Vec<f64> =
+            d.get(b"QuadPoints").and_then(|q| doc.resolve(q).as_array().map(|a| a.iter().filter_map(Object::as_f64).collect())).unwrap_or_default();
+        let mut rects: Vec<[f64; 4]> = quads
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|q| {
+                let xs = [q[0], q[2], q[4], q[6]];
+                let ys = [q[1], q[3], q[5], q[7]];
+                [
+                    xs.iter().copied().fold(f64::MAX, f64::min),
+                    ys.iter().copied().fold(f64::MAX, f64::min),
+                    xs.iter().copied().fold(f64::MIN, f64::max),
+                    ys.iter().copied().fold(f64::MIN, f64::max),
+                ]
+            })
+            .filter(|r| r.iter().all(|v| v.is_finite()))
+            .collect();
+        if rects.is_empty()
+            && let Some(r) = rect_of(doc, d.get(b"Rect"))
+        {
+            rects.push(r);
+        }
+        if rects.is_empty() {
+            unreadable += 1;
+            continue;
+        }
+        let overlay = d.get(b"OverlayText").and_then(|t| doc.resolve(t).as_string().map(|s| s.to_text())).unwrap_or_default();
+        out.push(Mark { page: index, obj: r, rects, fill: color(doc, d, b"IC"), overlay, look: overlay_look(doc, d) });
     }
     (out, unreadable)
 }
