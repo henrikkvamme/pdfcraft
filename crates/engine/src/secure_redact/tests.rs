@@ -436,26 +436,30 @@ fn a_mark_written_in_place_is_refused() {
     );
 }
 
-/// The box grows by the unit the renderer uses (a /UserUnit past 75000 counts as 75000), and
-/// its edges are written in full: an edge 0.00000049 units past a six-decimal step is not
-/// rounded off. (The renderer can't draw such pages exactly, so this is checked on the numbers.)
+/// A box covers every pixel its rectangle touches and GROW_PX more on each side, through the
+/// renderer's transform, and stays inside the raster.
 #[test]
-fn boxes_grow_by_the_unit_the_renderer_uses_and_keep_their_edges() {
-    let file = page("", "", "/UserUnit 1000000000", "", &[]);
-    let cos = pdfcraft_cos::Document::open(Arc::new(file)).unwrap();
-    let pg = pdfcraft_model::pages(&cos).swap_remove(0);
-    let grow = grow_units(&pg, &cos, 2.0);
-    assert!((grow - 1.0 / pdfcraft_model::MAX_USER_UNIT).abs() < 1e-15, "{grow}");
-    let mark = Mark {
+fn a_box_covers_the_pixels_its_rectangle_touches() {
+    // 2 pixels per point, y down: user (x, y) is pixel (2x, 2·(100 − y)).
+    let geometry = PageGeometry { object: Some(3), scale: 2.0, width: 100, height: 200, transform: [2.0, 0.0, 0.0, -2.0, 0.0, 200.0] };
+    let mark = |rects: Vec<[f64; 4]>| Mark {
         page: 0,
         obj: ObjRef { num: 6, generation: 0 },
-        rects: vec![[0.0001, 0.0, 0.00020049, 0.0005]],
-        fill: None,
+        rects,
+        fill: Some([1.0, 0.0, 0.0]),
         overlay: String::new(),
         look: Default::default(),
     };
-    let c = String::from_utf8(mask_content(&[&mark], 0.0).unwrap()).unwrap();
-    assert!(c.contains("0.0001 0 0.00010049 0.0005 re f"), "{c}");
+    let mut rgba = vec![255u8; 100 * 200 * 4];
+    paint_mark(&mut rgba, &geometry, &mark(vec![[10.25, 50.0, 20.0, 60.5]])).unwrap();
+    let red = |rgba: &[u8], x: usize, y: usize| rgba[(y * 100 + x) * 4..][..4] == [255, 0, 0, 255];
+    // x 20.5..40 px grows to 18.5..42, so pixels 18..=41; y 79..100 grows to 77..102, so 77..=101.
+    assert!(red(&rgba, 18, 77) && red(&rgba, 41, 101) && red(&rgba, 30, 90));
+    assert!(!red(&rgba, 17, 90) && !red(&rgba, 42, 90) && !red(&rgba, 30, 76) && !red(&rgba, 30, 102));
+    // Past the raster's edge: clamped, no panic.
+    paint_mark(&mut rgba, &geometry, &mark(vec![[-1e300, -1e300, 1e300, 1e300]])).unwrap();
+    assert!(red(&rgba, 0, 0) && red(&rgba, 99, 199));
+    assert!(matches!(paint_mark(&mut rgba, &geometry, &mark(vec![[f64::NAN, 0.0, 1.0, 1.0]])), Err(SecureError::UnreadableMark(1))));
 }
 
 /// A page that draws with a font only a /Pages node above it names (the renderer looks a name up
@@ -516,10 +520,10 @@ fn each_mark_keeps_its_colour() {
 }
 
 /// A page tree two readers walk differently (a page listed twice, a node without /Type that the
-/// renderer takes for a page) is refused even when they count the same number of pages: a mark
-/// would land on the wrong picture.
+/// renderer takes for a page): every picture of the marked page object gets the box, so the word
+/// shows on none of them.
 #[test]
-fn a_page_tree_read_two_ways_is_refused() {
+fn every_picture_of_a_marked_page_gets_its_box() {
     let file = pdf(
         &[
             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
@@ -536,6 +540,40 @@ fn a_page_tree_read_two_ways_is_refused() {
     );
     let mut s = Session::new();
     let id = s.open("tree.pdf", None, Arc::new(file), None).unwrap();
-    let job = s.secure_copy_job(id, SecureOptions { dpi: 100.0, ocr: false });
-    assert!(matches!(job, Err(EditError::SecureCopy(SecureError::PageTree { .. }))), "{:?}", job.err());
+    let job = s.secure_copy_job(id, SecureOptions { dpi: 72.0, ocr: false }).unwrap();
+    let pages = job.pages();
+    let out = job.run(None, |_, _| true).unwrap();
+    let mut r = PageRenderer::new(Arc::new(out.bytes), RenderConfig::default());
+    let mut boxed = 0;
+    for page in 0..pages {
+        let shot = r.render(RenderRequest { page, scale: 1.0, ..Default::default() });
+        let img = (shot.width, shot.height, shot.rgba.to_vec());
+        // The mark [40 190 250 220] is pixels x 40..250, y 80..110 at 72 dpi: all of it boxed.
+        let all_dark = shot.width >= 250 && (82..108).all(|y| (42..248).all(|x| px(&img, x as f32, y as f32)[0] < 60));
+        if all_dark {
+            boxed += 1;
+        }
+    }
+    assert!(boxed >= 2, "{boxed} of {pages} pictures have the box");
+}
+
+/// A mark on a page the renderer doesn't draw (here page 5, which the page walk finds under a
+/// node the renderer takes for a page) would be lost: refused.
+#[test]
+fn a_mark_on_a_page_not_drawn_is_refused() {
+    let file = pdf(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 3 /MediaBox [0 0 612 300] >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R >>".to_string(),
+            "<< /Kids [5 0 R] /Count 1 /Parent 2 0 R >>".to_string(),
+            "<< /Type /Page /Parent 4 0 R /Annots [6 0 R] >>".to_string(),
+            "<< /Type /Annot /Subtype /Redact /Rect [40 190 250 220] /IC [0 0 0] >>".to_string(),
+        ],
+        "",
+    );
+    let mut s = Session::new();
+    let id = s.open("t.pdf", None, Arc::new(file), None).unwrap();
+    let job = s.secure_copy_job(id, SecureOptions::default());
+    assert!(matches!(job, Err(EditError::SecureCopy(SecureError::PageTree(_)))), "{:?}", job.err());
 }

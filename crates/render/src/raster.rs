@@ -308,6 +308,41 @@ pub fn device_pixels(pt: f32, scale: f32) -> u32 {
     if px.is_finite() { px.ceil().max(1.0) as u32 } else { 1 }
 }
 
+/// The settings of a whole-page raster of a page displayed `w` × `h` points at `scale` (already
+/// within [`effective_scale`]). Shared by [`render_page`] and [`PageRenderer::page_geometry`], so
+/// the geometry reported is the one drawn.
+fn whole_page_settings(w: f32, h: f32, scale: f32) -> RenderSettings {
+    // hayro floors the size when none is given, losing the partial edge pixels. The scale keeps
+    // each side within MAX_SIDE (give or take float noise), so it fits u16.
+    let side = |pt: f32| device_pixels(pt, scale).min(MAX_SIDE as u32) as u16;
+    RenderSettings { x_scale: scale, y_scale: scale, width: Some(side(w)), height: Some(side(h)), ..Default::default() }
+}
+
+/// Where a whole-page raster puts a page: what [`PageRenderer::render`] draws for a request of
+/// that page and scale without a tile.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PageGeometry {
+    /// The page's object number (`None` for a page dictionary written in place in `/Kids`).
+    pub object: Option<u32>,
+    /// The scale the raster is drawn at: the request's, within the renderer's caps.
+    pub scale: f32,
+    /// The raster's size in pixels.
+    pub width: u32,
+    pub height: u32,
+    /// PDF user space to raster pixels (x right, y down), `[a b c d e f]`: x' = a·x + c·y + e,
+    /// y' = b·x + d·y + f. It accounts for the crop box, `/Rotate` and `/UserUnit` exactly as the
+    /// renderer does.
+    pub transform: [f64; 6],
+}
+
+impl PageGeometry {
+    /// A point in the page's user space, in raster pixels.
+    pub fn to_device(&self, x: f64, y: f64) -> [f64; 2] {
+        let [a, b, c, d, e, f] = self.transform;
+        [a * x + c * y + e, b * x + d * y + f]
+    }
+}
+
 /// Render one page with a caller-owned parser and cache. Panics inside the renderer are caught
 /// and reported as `Err((message, panicked))`.
 type Output = (u32, u32, Pixels, Option<Arc<crate::text::PageText>>);
@@ -366,18 +401,7 @@ fn render_page<'a>(
                         req_scale = req.scale
                     ));
                 }
-                // hayro floors the size when none is given, losing the partial edge pixels. The
-                // scale keeps each side within MAX_SIDE (give or take float noise), so it fits u16.
-                let side = |pt: f32| device_pixels(pt, scale).min(MAX_SIDE as u32) as u16;
-                RenderSettings {
-                    x_scale: scale,
-                    y_scale: scale,
-                    width: Some(side(w)),
-                    height: Some(side(h)),
-                    bg_color,
-                    color_replacement,
-                    ..Default::default()
-                }
+                RenderSettings { bg_color, color_replacement, ..whole_page_settings(w, h, scale) }
             }
         };
         // Rendered straight into a buffer of whole pixels, which the GUI takes over as is.
@@ -449,6 +473,29 @@ impl PageRenderer {
 
     pub fn page_count(&self) -> usize {
         self.pdf.as_ref().map(|p| p.pages().len()).unwrap_or(0)
+    }
+
+    /// Where a whole-page raster of `page` at `scale` puts the page ([`PageGeometry`]). `None`
+    /// for a page that doesn't exist or can't be rendered (an empty page box).
+    pub fn page_geometry(&self, page: usize, scale: f32) -> Option<PageGeometry> {
+        let pdf = self.pdf.as_ref()?;
+        catch_unwind(AssertUnwindSafe(|| {
+            let pages = pdf.pages();
+            let p = pages.get(page)?;
+            let (w, h) = p.render_dimensions();
+            if !(w.is_finite() && h.is_finite()) || w < 0.5 || h < 0.5 {
+                return None;
+            }
+            let scale = effective_scale(w, h, scale);
+            let (width, height) = render_size(p, &whole_page_settings(w, h, scale));
+            // As `hayro::render_into` draws a whole page: scaled, after the page's own transform.
+            let k = f64::from(scale);
+            let transform = p.initial_transform(true).as_coeffs().map(|v| v * k);
+            let object = p.raw().obj_id().and_then(|id| u32::try_from(id.obj_number).ok());
+            Some(PageGeometry { object, scale, width: width.into(), height: height.into(), transform })
+        }))
+        .ok()
+        .flatten()
     }
 
     /// The object number of each page this renderer draws, in its page order (`None` for a page

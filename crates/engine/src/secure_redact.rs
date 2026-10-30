@@ -7,14 +7,17 @@
 //!
 //! 1. renders every page the way it prints (page content and form fields, no comments), with
 //!    the reading colours off;
-//! 2. renders a second, mask page per marked page: the same page boxes, `/Rotate` and
-//!    `/UserUnit`, drawing nothing but the marks' rectangles (grown by [`GROW_PX`] device
-//!    pixels for anti-aliased edges). The renderer places both, so a box covers exactly what
-//!    the page drew there, whatever the page's geometry;
-//! 3. paints every pixel the mask covers in the mark's fill colour (white for a mark with none);
-//! 4. writes a new document holding one image per page, each page the displayed size of its
+//! 2. paints each mark's rectangles straight into those pixels, in the mark's fill colour (white
+//!    for a mark with none), grown by [`GROW_PX`] device pixels for anti-aliased edges. The
+//!    rectangles go to pixels through the transform the renderer drew the page with
+//!    ([`pdfcraft_render::PageGeometry`]: crop box, `/Rotate` and `/UserUnit` as it resolved
+//!    them), so a box covers what the page drew there. Nothing from the source is interpreted
+//!    to place the boxes, so nothing in it (inherited resources, colour spaces, fonts, page tree
+//!    shapes) can move or hide them. A mark goes on every picture of the page object it is on,
+//!    found by object number in the renderer's own page list;
+//! 3. writes a new document holding one image per page, each page the displayed size of its
 //!    source page, with an invisible OCR text layer read from those pixels when OCR is installed;
-//! 5. reads that document back and refuses it unless it holds only what this module writes
+//! 4. reads that document back and refuses it unless it holds only what this module writes
 //!    ([`check`]): no `/Info`, no metadata, outline, annotations, forms, structure or layers,
 //!    one revision, no object a page does not use.
 //!
@@ -28,7 +31,7 @@ use std::sync::Arc;
 use pdfcraft_cos::{Dict, ObjRef, Object, SaveOptions, Stream, write_full, write_incremental};
 use pdfcraft_print::Content;
 use pdfcraft_redact::Mark;
-use pdfcraft_render::{PRINT_TAG, PageInfo, PageRenderer, RenderConfig, RenderRequest, RequestKind};
+use pdfcraft_render::{PRINT_TAG, PageGeometry, PageInfo, PageRenderer, RenderConfig, RenderRequest, RequestKind};
 
 use crate::{DocId, EditError, Session, guard};
 
@@ -74,10 +77,8 @@ pub enum SecureError {
     OverlayText(usize),
     #[error("page {page} could not be rendered, so it can't be redacted safely: {reason}")]
     Render { page: usize, reason: String },
-    #[error(
-        "the document's page tree can't be read one way only ({model} pages one way, {renderer} the other, or not the same pages in the same order), so the marks can't be matched to the pages safely"
-    )]
-    PageTree { model: usize, renderer: usize },
+    #[error("the document's page tree can't be matched to its marks safely: {0}")]
+    PageTree(String),
     #[error("the secure copy would be larger than {} MiB; redact fewer pages at once or choose a lower resolution", MAX_OUTPUT_BYTES >> 20)]
     TooLarge,
     #[error("the secure copy failed its own check, so it was not made: {0}")]
@@ -132,10 +133,10 @@ pub struct SecureCopy {
 pub struct SecureJob {
     bytes: Arc<Vec<u8>>,
     config: RenderConfig,
-    /// Each page's displayed size in points, in the order the page walk finds them (the order of
-    /// the marks' page numbers; [`Session::secure_copy_job`] checks the renderer finds as many).
-    sizes: Vec<(f32, f32)>,
-    marks: Vec<Mark>,
+    /// The object number of each page the renderer draws, in its order.
+    pages: Vec<u32>,
+    /// The marks, each with the object number of the page it is on.
+    marks: Vec<(u32, Mark)>,
     /// The marked words to look for again in the output, lower case.
     words: Vec<String>,
     pub options: SecureOptions,
@@ -146,20 +147,21 @@ pub struct SecureJob {
 impl SecureJob {
     /// Pages to render, for progress.
     pub fn pages(&self) -> usize {
-        self.sizes.len()
+        self.pages.len()
     }
 
     /// Make the copy. `ocr` reads the text layer (`None`: no text layer). `progress(done,
     /// total)` is called before each page; returning `false` stops with [`SecureError::Cancelled`].
     pub fn run(self, ocr: Option<&pdfcraft_ocr::Ocr>, mut progress: impl FnMut(usize, usize) -> bool) -> Result<SecureCopy, SecureError> {
-        let total = self.sizes.len();
-        let (printed, masks) = guard(|| prepare(&self)).map_err(SecureError::Internal)??;
+        let total = self.pages.len();
+        let printed = guard(|| prepare(&self)).map_err(SecureError::Internal)??;
         let config = RenderConfig { transparent: false, hide_comments: false, ..self.config.clone() };
-        let mut page_r = PageRenderer::new(Arc::new(printed), config.clone());
-        let mut mask_r: Vec<PageRenderer> = masks
-            .into_iter()
-            .map(|m| PageRenderer::new(Arc::new(m), RenderConfig { transparent: true, layers: Arc::default(), ..config.clone() }))
-            .collect();
+        let mut page_r = PageRenderer::new(Arc::new(printed), config);
+        // The printed copy is the source with comments left out: the same pages.
+        if page_r.page_objects().iter().map(|o| o.unwrap_or(0)).ne(self.pages.iter().copied()) {
+            return Err(SecureError::PageTree("the pages to print are not the pages of the document".into()));
+        }
+        let dpi = if self.options.dpi.is_finite() { self.options.dpi.clamp(72.0, 600.0) } else { DEFAULT_DPI };
         let mut out = pdfcraft_cos::Document::new_empty();
         let pages_ref = page_tree(&out)?;
         let mut kids = Vec::with_capacity(total);
@@ -167,28 +169,27 @@ impl SecureJob {
             SecureReport { pages: Vec::with_capacity(total), marks: self.marks.len(), searchable: ocr.is_some(), still_found: Vec::new(), bytes: 0 };
         let mut found: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         let mut size = 0usize;
-        for (page, &(pw, ph)) in self.sizes.iter().enumerate() {
+        for (page, &object) in self.pages.iter().enumerate() {
             if !progress(page, total) {
                 return Err(SecureError::Cancelled);
             }
-            let scale = render_scale(pw, ph, self.options.dpi);
-            let shot = page_r.render(RenderRequest { page, scale, tag: PRINT_TAG, ..Default::default() });
+            let render_error = |reason: String| SecureError::Render { page: page + 1, reason };
+            let geometry = page_r.page_geometry(page, dpi / 72.0).ok_or_else(|| render_error("it has no page box to draw".into()))?;
+            let scale = geometry.scale;
+            let shot = page_r.render(RenderRequest { page, scale: dpi / 72.0, tag: PRINT_TAG, ..Default::default() });
             if let Some(reason) = shot.error {
-                return Err(SecureError::Render { page: page + 1, reason });
+                return Err(render_error(reason));
             }
             let (w, h) = (shot.width, shot.height);
+            if (w, h) != (geometry.width, geometry.height) || geometry.object != Some(object) {
+                return Err(render_error("the page was drawn differently than its geometry says".into()));
+            }
             let mut rgba = shot.rgba.to_vec();
             crate::print_raster::over_white(&mut rgba, false);
-            let marks = self.marks.iter().filter(|m| m.page == page).count();
-            for ((colour, _), mask_r) in colour_groups(&self.marks, page).into_iter().zip(mask_r.iter_mut()) {
-                let m = mask_r.render(RenderRequest { page, scale, tag: PRINT_TAG, ..Default::default() });
-                if let Some(reason) = m.error {
-                    return Err(SecureError::Render { page: page + 1, reason });
-                }
-                if (m.width, m.height) != (w, h) {
-                    return Err(SecureError::Render { page: page + 1, reason: "the marks rendered at a different size than the page".into() });
-                }
-                paint(&mut rgba, &m.rgba, colour);
+            let mut marks = 0;
+            for (_, m) in self.marks.iter().filter(|(on, _)| *on == object) {
+                paint_mark(&mut rgba, &geometry, m)?;
+                marks += 1;
             }
             let (words, (ow, oh)) = match ocr {
                 Some(o) => {
@@ -262,117 +263,43 @@ fn for_ocr(rgba: &[u8], w: u32, h: u32, scale: f32) -> (Option<Vec<u8>>, u32, u3
     (Some(small.into_raw()), ow, oh)
 }
 
-/// The scale (device pixels per point) a page displayed `w` × `h` points renders at for `dpi`.
-fn render_scale(w: f32, h: f32, dpi: f32) -> f32 {
-    let dpi = if dpi.is_finite() { dpi.clamp(72.0, 600.0) } else { DEFAULT_DPI };
-    pdfcraft_render::effective_scale(w, h, dpi / 72.0)
-}
-
-/// The documents to render: the source as it prints, and one mask document per fill colour
-/// (layer) of the busiest page: the same page tree and page boxes, each page drawing only the
-/// rectangles of its marks of that colour ([`colour_groups`]). The pages keep their tree, so
-/// both are read exactly as the viewer reads the source; nothing a mask page could inherit
-/// changes how it paints ([`mask_content`]).
-fn prepare(job: &SecureJob) -> Result<(Vec<u8>, Vec<Vec<u8>>), SecureError> {
+/// The source as it prints: page content and form fields, no comments (and no Redact marks).
+/// Only its pixels are used.
+fn prepare(job: &SecureJob) -> Result<Vec<u8>, SecureError> {
     let err = |e: pdfcraft_cos::CosError| SecureError::Internal(e.to_string());
-    let password = job.config.password.as_deref();
-    let mut cos = pdfcraft_cos::Document::open_with_password(job.bytes.clone(), password).map_err(err)?;
+    let mut cos = pdfcraft_cos::Document::open_with_password(job.bytes.clone(), job.config.password.as_deref()).map_err(err)?;
     pdfcraft_print::keep_printed(&mut cos, Content::Document);
-    let printed = write_incremental(&cos, &SaveOptions::default()).map_err(err)?;
-    let layers = (0..job.sizes.len()).map(|p| colour_groups(&job.marks, p).len()).max().unwrap_or(0);
-    let mut masks = Vec::with_capacity(layers);
-    for layer in 0..layers {
-        let mut mask = pdfcraft_cos::Document::open_with_password(job.bytes.clone(), password).map_err(err)?;
-        for (index, page) in pdfcraft_model::pages(&mask).into_iter().enumerate() {
-            let group = colour_groups(&job.marks, index).into_iter().nth(layer);
-            let content = match (group, job.sizes.get(index)) {
-                (Some((_, marks)), Some(&(w, h))) => Some(mask_content(&marks, grow_units(&page, &mask, render_scale(w, h, job.options.dpi)))?),
-                _ => None,
-            };
-            let stream = content.map(|c| mask.add(Object::Stream(Stream::flate(Dict::new(), &c))));
-            mask.update_dict(page.obj, |d| {
-                d.remove(b"Annots");
-                d.remove(b"Group");
-                d.set(b"Resources".to_vec(), Object::Dict(mask_resources()));
-                match stream {
-                    Some(s) => d.set(b"Contents".to_vec(), Object::Ref(s)),
-                    None => {
-                        d.remove(b"Contents");
-                    }
-                }
-            })
-            .map_err(err)?;
+    write_incremental(&cos, &SaveOptions::default()).map_err(err)
+}
+
+/// Paint `mark`'s rectangles into `rgba` (opaque RGBA of `geometry`'s size), in its fill colour
+/// (white when it has none: what is removed shows the paper). Each rectangle's corners go to
+/// pixels through the renderer's transform; every pixel the box touches is painted, and
+/// [`GROW_PX`] more on each side.
+fn paint_mark(rgba: &mut [u8], geometry: &PageGeometry, mark: &Mark) -> Result<(), SecureError> {
+    let colour = mark.fill.unwrap_or([1.0; 3]).map(|v| (if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 } * 255.0).round() as u8);
+    let (w, h) = (geometry.width as usize, geometry.height as usize);
+    let grow = f64::from(GROW_PX);
+    for &[x0, y0, x1, y1] in &mark.rects {
+        let corners = [[x0, y0], [x1, y0], [x0, y1], [x1, y1]].map(|[x, y]| geometry.to_device(x, y));
+        if corners.iter().flatten().any(|v| !v.is_finite()) {
+            return Err(SecureError::UnreadableMark(1));
         }
-        masks.push(write_incremental(&mask, &SaveOptions::default()).map_err(err)?);
-    }
-    Ok((printed, masks))
-}
-
-/// The marks on `page`, by the colour their boxes are painted (their `/IC`, white for none:
-/// what is removed shows the paper), in a fixed order.
-fn colour_groups(marks: &[Mark], page: usize) -> Vec<([u8; 3], Vec<&Mark>)> {
-    let mut groups: Vec<([u8; 3], Vec<&Mark>)> = Vec::new();
-    for m in marks.iter().filter(|m| m.page == page) {
-        let colour = m.fill.unwrap_or([1.0; 3]).map(|v| (if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 } * 255.0).round() as u8);
-        match groups.iter_mut().find(|(c, _)| *c == colour) {
-            Some((_, g)) => g.push(m),
-            None => groups.push((colour, vec![m])),
-        }
-    }
-    groups
-}
-
-/// The mask colour space's resource name.
-const MASK_CS: &str = "PCMask";
-
-/// A mask page's own resources: only [`MASK_CS`], a calibrated grey. The rectangles paint in it
-/// rather than in a device space, so no /DefaultGray, /DefaultRGB or /DefaultCMYK (which replace
-/// device spaces, and which the renderer also looks for in inherited resources) can make them
-/// paint nothing; and a name the page's own resources hold is never looked up elsewhere.
-fn mask_resources() -> Dict {
-    let mut cal = Dict::new();
-    cal.set(b"WhitePoint".to_vec(), Object::Array(vec![Object::Real(0.9505), 1.into(), Object::Real(1.089)]));
-    let mut spaces = Dict::new();
-    spaces.set(MASK_CS.as_bytes().to_vec(), Object::Array(vec![Object::name("CalGray"), Object::Dict(cal)]));
-    let mut res = Dict::new();
-    res.set(b"ColorSpace".to_vec(), Object::Dict(spaces));
-    res
-}
-
-/// [`GROW_PX`] device pixels in `page`'s user space at `scale` pixels per point. A user unit is
-/// as many points as the renderer takes it to be (`/UserUnit`, clamped as it clamps it), not the
-/// raw entry: a huge raw unit would make the growth nothing.
-fn grow_units(page: &pdfcraft_model::Page, doc: &pdfcraft_cos::Document, scale: f32) -> f64 {
-    f64::from(GROW_PX) / (f64::from(scale.max(1e-6)) * page.user_unit(doc))
-}
-
-/// A content stream filling the marks' rectangles, grown by `grow` user units, opaque in
-/// [`MASK_CS`]. Only where it paints counts ([`paint`]), not its colour.
-fn mask_content(marks: &[&Mark], grow: f64) -> Result<Vec<u8>, SecureError> {
-    let mut c = format!("/{MASK_CS} cs 0 sc\n").into_bytes();
-    for m in marks {
-        for rect in &m.rects {
-            let [x0, y0, x1, y1] = *rect;
-            let (x, y, w, h) = (x0 - grow, y0 - grow, x1 - x0 + 2.0 * grow, y1 - y0 + 2.0 * grow);
-            if ![x, y, w, h].iter().all(|v| v.is_finite()) {
-                return Err(SecureError::UnreadableMark(1));
+        let lo = |i: usize| corners.iter().map(|c| c[i]).fold(f64::MAX, f64::min) - grow;
+        let hi = |i: usize| corners.iter().map(|c| c[i]).fold(f64::MIN, f64::max) + grow;
+        // Clamped to the raster before converting, so no value is out of range for usize.
+        let span = |lo: f64, hi: f64, n: usize| (lo.floor().clamp(0.0, n as f64) as usize, hi.ceil().clamp(0.0, n as f64) as usize);
+        let (xa, xb) = span(lo(0), hi(0), w);
+        let (ya, yb) = span(lo(1), hi(1), h);
+        for y in ya..yb {
+            let row =
+                rgba.get_mut(y * w * 4..(y + 1) * w * 4).ok_or_else(|| SecureError::Internal("the page raster is smaller than its size".into()))?;
+            for px in row.as_chunks_mut::<4>().0.get_mut(xa..xb).unwrap_or_default() {
+                *px = [colour[0], colour[1], colour[2], 255];
             }
-            // Rust writes an f64 in full and never in exponent form, which PDF numbers can't use:
-            // no rounding moves an edge.
-            c.extend_from_slice(format!("{x} {y} {w} {h} re f\n").as_bytes());
         }
     }
-    Ok(c)
-}
-
-/// Paint every pixel the mask raster covers at all (a partly covered edge pixel too) in
-/// `colour`, fully opaque. `mask` is RGBA of the same size as `page` (opaque RGBA).
-fn paint(page: &mut [u8], mask: &[u8], colour: [u8; 3]) {
-    for (px, m) in page.as_chunks_mut::<4>().0.iter_mut().zip(mask.as_chunks::<4>().0) {
-        if m[3] != 0 {
-            *px = [colour[0], colour[1], colour[2], 255];
-        }
-    }
+    Ok(())
 }
 
 fn page_tree(doc: &pdfcraft_cos::Document) -> Result<ObjRef, SecureError> {
@@ -575,28 +502,29 @@ impl Session {
             return Err(SecureError::OverlayText(overlays).into());
         }
         let infos = doc.info.pages.clone();
-        // The marks are numbered by the page walk, the pictures by the renderer: they must find
-        // the same page objects in the same order (a page listed twice, or a node one of them
-        // takes for a page, would put a mark on the wrong picture).
-        let model: Vec<Option<u32>> = guard(|| pdfcraft_model::pages(&cos).iter().map(|p| Some(p.obj.num)).collect()).map_err(EditError::Invalid)?;
-        let renderer = guard(|| PageRenderer::new(src.bytes.clone(), src.config.clone()).page_objects()).map_err(EditError::Invalid)?;
-        if model != renderer || model.iter().any(Option::is_none) {
-            return Err(SecureError::PageTree { model: model.len(), renderer: renderer.len() }.into());
+        // The pictures are the renderer's pages; each mark goes on every picture of the page object
+        // it is on. A page the renderer has no object number for (a dictionary written in place)
+        // can't be matched, and a marked page it doesn't draw would lose its marks: refused.
+        let pages: Vec<Option<u32>> =
+            guard(|| PageRenderer::new(src.bytes.clone(), src.config.clone()).page_objects()).map_err(EditError::Invalid)?;
+        let pages: Vec<u32> = pages
+            .into_iter()
+            .collect::<Option<_>>()
+            .ok_or_else(|| SecureError::PageTree("a page is written in place, not as an object of its own".into()))?;
+        let walk: Vec<u32> = guard(|| pdfcraft_model::pages(&cos).iter().map(|p| p.obj.num).collect()).map_err(EditError::Invalid)?;
+        let mut on_pages = Vec::with_capacity(marks.len());
+        for m in marks {
+            let object = walk.get(m.page).copied().filter(|o| pages.contains(o));
+            let object = object.ok_or_else(|| {
+                SecureError::PageTree(format!("a mark is on a page (page {} of the page walk) the renderer doesn't draw", m.page + 1))
+            })?;
+            on_pages.push((object, m));
         }
-        let sizes = guard(|| {
-            pdfcraft_model::pages(&cos)
-                .iter()
-                .map(|p| {
-                    let (w, h) = p.display_size(&cos);
-                    (w as f32, h as f32)
-                })
-                .collect::<Vec<_>>()
-        })
-        .map_err(EditError::Invalid)?;
-        let words = guard(|| marked_words(&src.bytes, &src.config, &infos, &marks)).map_err(EditError::Invalid)?;
+        let plain: Vec<Mark> = on_pages.iter().map(|(_, m)| m.clone()).collect();
+        let words = guard(|| marked_words(&src.bytes, &src.config, &infos, &plain)).map_err(EditError::Invalid)?;
         let stem = doc.display_name();
         let stem = stem.strip_suffix(".pdf").or_else(|| stem.strip_suffix(".PDF")).unwrap_or(&stem);
-        Ok(SecureJob { bytes: src.bytes, config: src.config, sizes, marks, words, options, name: format!("{stem} (redacted).pdf") })
+        Ok(SecureJob { bytes: src.bytes, config: src.config, pages, marks: on_pages, words, options, name: format!("{stem} (redacted).pdf") })
     }
 
     /// Make a secure redacted copy of document `id` and open it as a new, unsaved document.
