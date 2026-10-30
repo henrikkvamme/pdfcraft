@@ -514,3 +514,28 @@ fn each_mark_keeps_its_colour() {
     assert_eq!(px(&img, 350.0, 175.0), [0, 0, 255, 255]);
     assert_eq!(px(&img, 250.0, 175.0), [255, 255, 255, 255]);
 }
+
+/// A page tree two readers walk differently (a page listed twice, a node without /Type that the
+/// renderer takes for a page) is refused even when they count the same number of pages: a mark
+/// would land on the wrong picture.
+#[test]
+fn a_page_tree_read_two_ways_is_refused() {
+    let file = pdf(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R 3 0 R 4 0 R] /Count 3 /MediaBox [0 0 612 300] >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 7 0 R >> >> /Contents 8 0 R /Annots [9 0 R] >>".to_string(),
+            "<< /Kids [5 0 R 6 0 R] /Count 2 /Parent 2 0 R >>".to_string(),
+            "<< /Type /Page /Parent 4 0 R >>".to_string(),
+            "<< /Type /Page /Parent 4 0 R >>".to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_string(),
+            stream("", VISIBLE),
+            "<< /Type /Annot /Subtype /Redact /Rect [40 190 250 220] /IC [0 0 0] >>".to_string(),
+        ],
+        "",
+    );
+    let mut s = Session::new();
+    let id = s.open("tree.pdf", None, Arc::new(file), None).unwrap();
+    let job = s.secure_copy_job(id, SecureOptions { dpi: 100.0, ocr: false });
+    assert!(matches!(job, Err(EditError::SecureCopy(SecureError::PageTree { .. }))), "{:?}", job.err());
+}

@@ -451,6 +451,16 @@ impl PageRenderer {
         self.pdf.as_ref().map(|p| p.pages().len()).unwrap_or(0)
     }
 
+    /// The object number of each page this renderer draws, in its page order (`None` for a page
+    /// that is not an object of its own, such as a dictionary written in place in `/Kids`). A
+    /// caller that numbers pages another way can check the two agree page for page.
+    pub fn page_objects(&self) -> Vec<Option<u32>> {
+        self.pdf
+            .as_ref()
+            .map(|p| p.pages().iter().map(|page| page.raw().obj_id().and_then(|id| u32::try_from(id.obj_number).ok())).collect())
+            .unwrap_or_default()
+    }
+
     /// Snapshot the work counters collected by this renderer.
     pub fn stats(&self) -> RenderStats {
         self.stats

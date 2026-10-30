@@ -75,7 +75,7 @@ pub enum SecureError {
     #[error("page {page} could not be rendered, so it can't be redacted safely: {reason}")]
     Render { page: usize, reason: String },
     #[error(
-        "the document's page tree can't be read one way only ({model} pages one way, {renderer} the other), so the marks can't be matched to the pages safely"
+        "the document's page tree can't be read one way only ({model} pages one way, {renderer} the other, or not the same pages in the same order), so the marks can't be matched to the pages safely"
     )]
     PageTree { model: usize, renderer: usize },
     #[error("the secure copy would be larger than {} MiB; redact fewer pages at once or choose a lower resolution", MAX_OUTPUT_BYTES >> 20)]
@@ -575,11 +575,13 @@ impl Session {
             return Err(SecureError::OverlayText(overlays).into());
         }
         let infos = doc.info.pages.clone();
-        // The marks are numbered by the page walk, the pictures by the renderer: they must agree.
-        let model = guard(|| pdfcraft_model::pages(&cos).len()).map_err(EditError::Invalid)?;
-        let renderer = guard(|| PageRenderer::new(src.bytes.clone(), src.config.clone()).page_count()).map_err(EditError::Invalid)?;
-        if model != renderer {
-            return Err(SecureError::PageTree { model, renderer }.into());
+        // The marks are numbered by the page walk, the pictures by the renderer: they must find
+        // the same page objects in the same order (a page listed twice, or a node one of them
+        // takes for a page, would put a mark on the wrong picture).
+        let model: Vec<Option<u32>> = guard(|| pdfcraft_model::pages(&cos).iter().map(|p| Some(p.obj.num)).collect()).map_err(EditError::Invalid)?;
+        let renderer = guard(|| PageRenderer::new(src.bytes.clone(), src.config.clone()).page_objects()).map_err(EditError::Invalid)?;
+        if model != renderer || model.iter().any(Option::is_none) {
+            return Err(SecureError::PageTree { model: model.len(), renderer: renderer.len() }.into());
         }
         let sizes = guard(|| {
             pdfcraft_model::pages(&cos)
