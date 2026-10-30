@@ -653,3 +653,34 @@ fn a_mark_without_area_is_refused() {
     let job = s.secure_copy_job(id, SecureOptions::default());
     assert!(matches!(job, Err(EditError::SecureCopy(SecureError::UnreadableMark(1)))), "{:?}", job.err());
 }
+
+/// Every /Annots entry is read, past one that doesn't resolve; a QuadPoints list with an entry
+/// that isn't a number is refused rather than read up to it.
+#[test]
+fn every_annotation_entry_is_read() {
+    let file = page(
+        "",
+        VISIBLE,
+        "/Annots [6 0 R 99 0 R 7 0 R]",
+        "",
+        &[
+            "<< /Type /Annot /Subtype /Redact /Rect [40 190 250 220] /IC [0 0 0] >>".to_string(),
+            "<< /Type /Annot /Subtype /Redact /Rect [40 110 250 135] /IC [0 0 0] >>".to_string(),
+        ],
+    );
+    let mut s = Session::new();
+    let id = s.open("t.pdf", None, Arc::new(file), None).unwrap();
+    let out = s.secure_copy_job(id, SecureOptions { dpi: 72.0, ocr: false }).unwrap().run(None, |_, _| true).unwrap();
+    assert_eq!(out.report.marks, 2, "the mark after the missing object is read");
+    let bad_quads = page(
+        "",
+        VISIBLE,
+        "/Annots [6 0 R]",
+        "",
+        &["<< /Type /Annot /Subtype /Redact /Rect [0 0 1 1] /QuadPoints [40 220 250 220 40 190 250 190 /X 40 135 250 135 40 110 250 110] >>"
+            .to_string()],
+    );
+    let id = s.open("q.pdf", None, Arc::new(bad_quads), None).unwrap();
+    let job = s.secure_copy_job(id, SecureOptions::default());
+    assert!(matches!(job, Err(EditError::SecureCopy(SecureError::UnreadableMark(1)))), "{:?}", job.err());
+}

@@ -42,6 +42,9 @@ pub const DEFAULT_DPI: f32 = 300.0;
 /// The largest output a secure copy may build (compressed image data and text layers). A
 /// document past it fails with [`SecureError::TooLarge`] instead of exhausting memory.
 pub const MAX_OUTPUT_BYTES: usize = 1 << 30;
+/// The most rectangles all marks together may have (about 32 MB of them). A document past it
+/// fails with [`SecureError::TooManyMarks`] instead of exhausting memory.
+pub const MAX_MARK_RECTS: usize = 1_000_000;
 /// Marked words shorter than this are not looked for again in the output (they match
 /// everywhere).
 const MIN_WORD: usize = 4;
@@ -78,6 +81,8 @@ pub enum SecureError {
     Render { page: usize, reason: String },
     #[error("the document's page tree can't be matched to its marks safely: {0}")]
     PageTree(String),
+    #[error("the document has more than {MAX_MARK_RECTS} redaction areas, more than a secure copy takes")]
+    TooManyMarks,
     #[error("the secure copy would be larger than {} MiB; redact fewer pages at once or choose a lower resolution", MAX_OUTPUT_BYTES >> 20)]
     TooLarge,
     #[error("the secure copy failed its own check, so it was not made: {0}")]
@@ -488,10 +493,14 @@ impl Session {
             let r = PageRenderer::new(src.bytes.clone(), src.config.clone());
             let pages = r.page_count();
             let (mut marks, mut unreadable) = (Vec::new(), 0usize);
+            let mut budget = MAX_MARK_RECTS;
             for page in 0..pages {
-                let (found, bad) = r.page_redactions(page).ok_or_else(|| SecureError::PageTree(format!("page {} can't be read", page + 1)))?;
-                unreadable += bad;
-                marks.extend(found.into_iter().map(|m| (page, m)));
+                let found = r.page_redactions(page, &mut budget).ok_or_else(|| SecureError::PageTree(format!("page {} can't be read", page + 1)))?;
+                if found.exhausted {
+                    return Err(SecureError::TooManyMarks);
+                }
+                unreadable += found.unreadable;
+                marks.extend(found.marks.into_iter().map(|m| (page, m)));
             }
             Ok((pages, marks, unreadable))
         })

@@ -318,6 +318,16 @@ fn whole_page_settings(w: f32, h: f32, scale: f32) -> RenderSettings {
     RenderSettings { x_scale: scale, y_scale: scale, width: Some(side(w)), height: Some(side(h)), ..Default::default() }
 }
 
+/// What [`PageRenderer::page_redactions`] found on a page.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PageRedactions {
+    pub marks: Vec<Redaction>,
+    /// Redact annotations with no readable area.
+    pub unreadable: usize,
+    /// The rectangle budget ran out before the page was read to the end.
+    pub exhausted: bool,
+}
+
 /// A Redact annotation as [`PageRenderer::page_redactions`] reads it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Redaction {
@@ -509,51 +519,76 @@ impl PageRenderer {
         .flatten()
     }
 
-    /// The Redact annotations of `page`, read from the page dictionary this renderer draws, the
-    /// way it reads the annotations it draws (each `/Annots` entry, a reference or written in
-    /// place, `/Subtype` resolved), and how many have no readable area. `None` when the page
-    /// doesn't exist. A caller placing boxes over what [`Self::render`] drew reads the marks
-    /// here, so the marks and the pictures come from one reading of the file.
-    pub fn page_redactions(&self, page: usize) -> Option<(Vec<Redaction>, usize)> {
-        use hayro::hayro_syntax::object::{Array, Dict, Name};
+    /// The Redact annotations of `page`, read from the page dictionary this renderer draws:
+    /// every `/Annots` entry, a reference (resolved here) or written in place, with its
+    /// `/Subtype` resolved; an entry that doesn't resolve to a dictionary is not an annotation and
+    /// is passed over, and the entries after it are still read. `budget` is the number of
+    /// rectangles the caller still accepts; reading stops with [`PageRedactions::exhausted`] set
+    /// when it runs out. `None` when the page doesn't exist. A caller placing boxes over what
+    /// [`Self::render`] drew reads the marks here, so the marks and the pictures come from one
+    /// reading of the file.
+    pub fn page_redactions(&self, page: usize, budget: &mut usize) -> Option<PageRedactions> {
+        use hayro::hayro_syntax::object::{Array, Dict, MaybeRef, Name, Object, ObjectIdentifier};
         let pdf = self.pdf.as_ref()?;
         catch_unwind(AssertUnwindSafe(|| {
             let pages = pdf.pages();
             let p = pages.get(page)?;
-            let (mut found, mut unreadable) = (Vec::new(), 0usize);
-            let Some(annots) = p.raw().get::<Array<'_>>(b"Annots") else { return Some((found, unreadable)) };
-            for annot in annots.iter::<Dict<'_>>() {
+            let mut out = PageRedactions::default();
+            let Some(annots) = p.raw().get::<Array<'_>>(b"Annots") else { return Some(out) };
+            for entry in annots.raw_iter() {
+                let annot = match entry {
+                    MaybeRef::Ref(r) => p.xref().get::<Dict<'_>>(ObjectIdentifier::from(r)),
+                    MaybeRef::NotRef(Object::Dict(d)) => Some(d),
+                    MaybeRef::NotRef(_) => None,
+                };
+                let Some(annot) = annot else { continue };
                 if annot.get::<Name<'_>>(b"Subtype").as_deref() != Some(b"Redact".as_slice()) {
                     continue;
                 }
                 let finite = |r: &[f64; 4]| r.iter().all(|v| v.is_finite());
-                let quads: Vec<f64> = annot.get::<Array<'_>>(b"QuadPoints").map(|a| a.iter::<f64>().collect()).unwrap_or_default();
-                let mut rects: Vec<[f64; 4]> = quads
-                    .as_chunks::<8>()
-                    .0
-                    .iter()
-                    .map(|q| {
-                        let (xs, ys) = ([q[0], q[2], q[4], q[6]], [q[1], q[3], q[5], q[7]]);
-                        [
-                            xs.iter().copied().fold(f64::MAX, f64::min),
-                            ys.iter().copied().fold(f64::MAX, f64::min),
-                            xs.iter().copied().fold(f64::MIN, f64::max),
-                            ys.iter().copied().fold(f64::MIN, f64::max),
-                        ]
-                    })
-                    .filter(finite)
-                    .collect();
+                // Every entry must be a number and the quads complete: a list read only up to a
+                // bad entry would lose the quads after it.
+                let quad_array = annot.get::<Array<'_>>(b"QuadPoints");
+                let quads: Vec<f64> = quad_array.as_ref().map(|a| a.iter::<f64>().collect()).unwrap_or_default();
+                if quad_array.is_some_and(|a| a.raw_iter().count() != quads.len()) || !quads.len().is_multiple_of(8) {
+                    out.unreadable += 1;
+                    continue;
+                }
+                let mut rects: Vec<[f64; 4]> = Vec::new();
+                for q in quads.as_chunks::<8>().0 {
+                    let (xs, ys) = ([q[0], q[2], q[4], q[6]], [q[1], q[3], q[5], q[7]]);
+                    let r = [
+                        xs.iter().copied().fold(f64::MAX, f64::min),
+                        ys.iter().copied().fold(f64::MAX, f64::min),
+                        xs.iter().copied().fold(f64::MIN, f64::max),
+                        ys.iter().copied().fold(f64::MIN, f64::max),
+                    ];
+                    if !finite(&r) {
+                        continue;
+                    }
+                    let Some(left) = budget.checked_sub(1) else {
+                        out.exhausted = true;
+                        return Some(out);
+                    };
+                    *budget = left;
+                    rects.push(r);
+                }
                 if rects.is_empty() {
                     let rect: Vec<f64> = annot.get::<Array<'_>>(b"Rect").map(|a| a.iter::<f64>().collect()).unwrap_or_default();
                     if let [a, b, c, d] = rect[..] {
                         let r = [a.min(c), b.min(d), a.max(c), b.max(d)];
                         if finite(&r) {
+                            let Some(left) = budget.checked_sub(1) else {
+                                out.exhausted = true;
+                                return Some(out);
+                            };
+                            *budget = left;
                             rects.push(r);
                         }
                     }
                 }
                 if rects.is_empty() {
-                    unreadable += 1;
+                    out.unreadable += 1;
                     continue;
                 }
                 let ic: Vec<f64> = annot.get::<Array<'_>>(b"IC").map(|a| a.iter::<f64>().collect()).unwrap_or_default();
@@ -563,9 +598,9 @@ impl PageRenderer {
                     [c, m, y, k] => Some([(1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - y) * (1.0 - k)]),
                     _ => None,
                 };
-                found.push(Redaction { rects, fill, overlay: annot.contains_key(b"OverlayText") });
+                out.marks.push(Redaction { rects, fill, overlay: annot.contains_key(b"OverlayText") });
             }
-            Some((found, unreadable))
+            Some(out)
         }))
         .ok()
         .flatten()

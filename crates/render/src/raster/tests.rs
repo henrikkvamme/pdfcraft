@@ -7102,3 +7102,32 @@ fn page_geometry_is_where_the_page_is_drawn() {
         }
     }
 }
+
+/// `page_redactions` stops when the rectangle budget runs out, and says so.
+#[test]
+fn page_redactions_keep_to_their_budget() {
+    let objs = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 300] >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /Annots [4 0 R] >>".to_string(),
+        "<< /Type /Annot /Subtype /Redact /Rect [0 0 1 1] /QuadPoints [0 20 10 20 0 10 10 10 0 40 10 40 0 30 10 30] >>".to_string(),
+    ];
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+    for o in offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+    let r = PageRenderer::new(Arc::new(out), RenderConfig::default());
+    let mut budget = 2;
+    let found = r.page_redactions(0, &mut budget).unwrap();
+    assert_eq!((found.marks.len(), found.marks[0].rects.len(), found.exhausted, budget), (1, 2, false, 0));
+    let mut budget = 1;
+    assert!(r.page_redactions(0, &mut budget).unwrap().exhausted);
+}
