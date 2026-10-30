@@ -547,15 +547,24 @@ impl PageRenderer {
                 }
                 let finite = |r: &[f64; 4]| r.iter().all(|v| v.is_finite());
                 // Every entry must be a number and the quads complete: a list read only up to a
-                // bad entry would lose the quads after it.
+                // bad entry would lose the quads after it. The numbers are read eight at a time,
+                // and each rectangle is counted against the budget before it is kept.
                 let quad_array = annot.get::<Array<'_>>(b"QuadPoints");
-                let quads: Vec<f64> = quad_array.as_ref().map(|a| a.iter::<f64>().collect()).unwrap_or_default();
-                if quad_array.is_some_and(|a| a.raw_iter().count() != quads.len()) || !quads.len().is_multiple_of(8) {
+                let entries = quad_array.as_ref().map_or(0, |a| a.raw_iter().count());
+                if !entries.is_multiple_of(8) {
                     out.unreadable += 1;
                     continue;
                 }
                 let mut rects: Vec<[f64; 4]> = Vec::new();
-                for q in quads.as_chunks::<8>().0 {
+                let mut numbers = quad_array.as_ref().map(|a| a.iter::<f64>());
+                let mut read = 0usize;
+                while let Some(nums) = numbers.as_mut() {
+                    let mut q = [0.0f64; 8];
+                    let got = q.iter_mut().map_while(|slot| nums.next().map(|v| *slot = v)).count();
+                    read += got;
+                    if got < 8 {
+                        break;
+                    }
                     let (xs, ys) = ([q[0], q[2], q[4], q[6]], [q[1], q[3], q[5], q[7]]);
                     let r = [
                         xs.iter().copied().fold(f64::MAX, f64::min),
@@ -572,6 +581,10 @@ impl PageRenderer {
                     };
                     *budget = left;
                     rects.push(r);
+                }
+                if read != entries {
+                    out.unreadable += 1;
+                    continue;
                 }
                 if rects.is_empty() {
                     let rect: Vec<f64> = annot.get::<Array<'_>>(b"Rect").map(|a| a.iter::<f64>().collect()).unwrap_or_default();
