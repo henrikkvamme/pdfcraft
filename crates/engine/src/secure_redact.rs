@@ -5,16 +5,17 @@
 //! interpreter finds under each mark, then cleans every other place a copy of the text can be
 //! (metadata, tags, patterns, layers …). A place nobody thought of stays. A secure copy instead:
 //!
-//! 1. renders every page the way it prints (page content and form fields, no comments), with
-//!    the reading colours off;
+//! 1. renders every page of the source with its form fields and links but no comments, with the
+//!    reading colours off, and reads each drawn page's Redact annotations from the same reading
+//!    of the file ([`PageRenderer::page_redactions`]): one reader decides both what is drawn
+//!    and where the boxes go;
 //! 2. paints each mark's rectangles straight into those pixels, in the mark's fill colour (white
 //!    for a mark with none), grown by [`GROW_PX`] device pixels for anti-aliased edges. The
 //!    rectangles go to pixels through the transform the renderer drew the page with
 //!    ([`pdfcraft_render::PageGeometry`]: crop box, `/Rotate` and `/UserUnit` as it resolved
 //!    them), so a box covers what the page drew there. Nothing from the source is interpreted
-//!    to place the boxes, so nothing in it (inherited resources, colour spaces, fonts, page tree
-//!    shapes) can move or hide them. A mark goes on every picture of the page object it is on,
-//!    found by object number in the renderer's own page list;
+//!    a second time to place the boxes, so nothing in it (inherited resources, colour spaces,
+//!    fonts, page tree shapes) can move or hide them. The marks of page N go on picture N;
 //! 3. writes a new document holding one image per page, each page the displayed size of its
 //!    source page, with an invisible OCR text layer read from those pixels when OCR is installed;
 //! 4. reads that document back and refuses it unless it holds only what this module writes
@@ -28,10 +29,8 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use pdfcraft_cos::{Dict, ObjRef, Object, SaveOptions, Stream, write_full, write_incremental};
-use pdfcraft_print::Content;
-use pdfcraft_redact::Mark;
-use pdfcraft_render::{PRINT_TAG, PageGeometry, PageRenderer, RenderConfig, RenderRequest, RequestKind};
+use pdfcraft_cos::{Dict, ObjRef, Object, SaveOptions, Stream, write_full};
+use pdfcraft_render::{PRINT_TAG, PageGeometry, PageRenderer, Redaction, RenderConfig, RenderRequest, RequestKind};
 
 use crate::{DocId, EditError, Session, guard};
 
@@ -135,8 +134,8 @@ pub struct SecureJob {
     config: RenderConfig,
     /// How many pages the renderer draws.
     pages: usize,
-    /// The marks; each one's `page` is the renderer's page it was read from.
-    marks: Vec<Mark>,
+    /// The marks, each with the page (the renderer's) it was read from.
+    marks: Vec<(usize, Redaction)>,
     /// The marked words to look for again in the output, lower case.
     words: Vec<String>,
     pub options: SecureOptions,
@@ -154,13 +153,12 @@ impl SecureJob {
     /// total)` is called before each page; returning `false` stops with [`SecureError::Cancelled`].
     pub fn run(self, ocr: Option<&pdfcraft_ocr::Ocr>, mut progress: impl FnMut(usize, usize) -> bool) -> Result<SecureCopy, SecureError> {
         let total = self.pages;
-        let printed = guard(|| prepare(&self)).map_err(SecureError::Internal)??;
-        let config = RenderConfig { transparent: false, hide_comments: false, ..self.config.clone() };
-        let mut page_r = PageRenderer::new(Arc::new(printed), config);
-        // The printed copy is the source with comments left out (only /Annots arrays change): the
-        // same pages in the same order.
+        // The source itself, drawn without comments (form fields and links stay, as they print):
+        // the same reading of the file the marks were read from, so picture N is page N.
+        let config = RenderConfig { transparent: false, hide_comments: true, ..self.config.clone() };
+        let mut page_r = PageRenderer::new(self.bytes.clone(), config);
         if page_r.page_count() != total {
-            return Err(SecureError::PageTree("the pages to print are not the pages of the document".into()));
+            return Err(SecureError::PageTree("the document changed while the copy was being made".into()));
         }
         let dpi = if self.options.dpi.is_finite() { self.options.dpi.clamp(72.0, 600.0) } else { DEFAULT_DPI };
         let mut out = pdfcraft_cos::Document::new_empty();
@@ -188,7 +186,7 @@ impl SecureJob {
             let mut rgba = shot.rgba.to_vec();
             crate::print_raster::over_white(&mut rgba, false);
             let mut marks = 0;
-            for m in self.marks.iter().filter(|m| m.page == page) {
+            for (_, m) in self.marks.iter().filter(|(on, _)| *on == page) {
                 paint_mark(&mut rgba, &geometry, m)?;
                 marks += 1;
             }
@@ -264,20 +262,11 @@ fn for_ocr(rgba: &[u8], w: u32, h: u32, scale: f32) -> (Option<Vec<u8>>, u32, u3
     (Some(small.into_raw()), ow, oh)
 }
 
-/// The source as it prints: page content and form fields, no comments (and no Redact marks).
-/// Only its pixels are used.
-fn prepare(job: &SecureJob) -> Result<Vec<u8>, SecureError> {
-    let err = |e: pdfcraft_cos::CosError| SecureError::Internal(e.to_string());
-    let mut cos = pdfcraft_cos::Document::open_with_password(job.bytes.clone(), job.config.password.as_deref()).map_err(err)?;
-    pdfcraft_print::keep_printed(&mut cos, Content::Document);
-    write_incremental(&cos, &SaveOptions::default()).map_err(err)
-}
-
 /// Paint `mark`'s rectangles into `rgba` (opaque RGBA of `geometry`'s size), in its fill colour
 /// (white when it has none: what is removed shows the paper). Each rectangle's corners go to
 /// pixels through the renderer's transform; every pixel the box touches is painted, and
 /// [`GROW_PX`] more on each side.
-fn paint_mark(rgba: &mut [u8], geometry: &PageGeometry, mark: &Mark) -> Result<(), SecureError> {
+fn paint_mark(rgba: &mut [u8], geometry: &PageGeometry, mark: &Redaction) -> Result<(), SecureError> {
     let colour = mark.fill.unwrap_or([1.0; 3]).map(|v| (if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 } * 255.0).round() as u8);
     let (w, h) = (geometry.width as usize, geometry.height as usize);
     let grow = f64::from(GROW_PX);
@@ -477,6 +466,9 @@ fn stream_of(o: &Object) -> Option<&Stream> {
     }
 }
 
+/// The renderer's page count, the marks with their pages, and how many marks have no area.
+type Marks = (usize, Vec<(usize, Redaction)>, usize);
+
 impl Session {
     /// Capture what a secure redacted copy of document `id` needs. Refused when it has no
     /// marks, a mark without area or with overlay text, or when its security settings don't
@@ -488,30 +480,18 @@ impl Session {
         }
         doc.check_copying()?;
         let src = doc.export_source();
-        let cos = guard(|| pdfcraft_cos::Document::open_with_password(src.bytes.clone(), src.config.password.as_deref()))
-            .map_err(EditError::Invalid)?
-            .map_err(|e| EditError::Invalid(e.to_string()))?;
-        // The pictures are the renderer's pages, and the marks are read from the very page
-        // dictionaries it draws: each page's own /Annots, entry by entry, as the renderer reads
-        // them. No page is matched by number or identity, so a page listed twice, written in
-        // place, or that another reader walks differently gets exactly its own marks. A Redact
-        // annotation written in place can't be read as an object: refused.
-        let (pages, marks, unreadable) = guard(|| -> Result<(usize, Vec<Mark>, usize), SecureError> {
+        // The pictures and the marks come from one reading of the file, the renderer's: each page
+        // it draws, the Redact annotations of that very page dictionary. No page is matched by
+        // number or identity across two readers, so a page listed twice, written in place, or
+        // that another reader walks or resolves differently gets exactly its own marks.
+        let (pages, marks, unreadable) = guard(|| -> Result<Marks, SecureError> {
             let r = PageRenderer::new(src.bytes.clone(), src.config.clone());
             let pages = r.page_count();
             let (mut marks, mut unreadable) = (Vec::new(), 0usize);
             for page in 0..pages {
-                let entries = r.page_annotations(page).ok_or_else(|| SecureError::PageTree(format!("page {} can't be read", page + 1)))?;
-                for entry in entries {
-                    let (num, generation) = entry.ok_or_else(|| {
-                        SecureError::PageTree(format!("a redaction mark on page {} is written in place, not as an object of its own", page + 1))
-                    })?;
-                    match pdfcraft_redact::mark_of(&cos, page, ObjRef { num, generation }) {
-                        Ok(Some(m)) => marks.push(m),
-                        Ok(None) => {}
-                        Err(_) => unreadable += 1,
-                    }
-                }
+                let (found, bad) = r.page_redactions(page).ok_or_else(|| SecureError::PageTree(format!("page {} can't be read", page + 1)))?;
+                unreadable += bad;
+                marks.extend(found.into_iter().map(|m| (page, m)));
             }
             Ok((pages, marks, unreadable))
         })
@@ -522,7 +502,7 @@ impl Session {
         if marks.is_empty() {
             return Err(SecureError::NoMarks.into());
         }
-        let overlays = marks.iter().filter(|m| !m.overlay.is_empty()).count();
+        let overlays = marks.iter().filter(|(_, m)| m.overlay).count();
         if overlays > 0 {
             return Err(SecureError::OverlayText(overlays).into());
         }
@@ -547,10 +527,10 @@ impl Session {
 
 /// The words under the marks (lower case, at least [`MIN_WORD`] characters), read from the
 /// page's own text layer.
-fn marked_words(bytes: &Arc<Vec<u8>>, config: &RenderConfig, marks: &[Mark]) -> Vec<String> {
+fn marked_words(bytes: &Arc<Vec<u8>>, config: &RenderConfig, marks: &[(usize, Redaction)]) -> Vec<String> {
     let mut r = PageRenderer::new(bytes.clone(), config.clone());
     let mut out: Vec<String> = Vec::new();
-    let mut pages: Vec<usize> = marks.iter().map(|m| m.page).collect();
+    let mut pages: Vec<usize> = marks.iter().map(|(page, _)| *page).collect();
     pages.sort_unstable();
     pages.dedup();
     for page in pages {
@@ -562,7 +542,7 @@ fn marked_words(bytes: &Arc<Vec<u8>>, config: &RenderConfig, marks: &[Mark]) -> 
             continue;
         };
         let k = f64::from(view.scale.max(1e-6));
-        for m in marks.iter().filter(|m| m.page == page) {
+        for (_, m) in marks.iter().filter(|(on, _)| *on == page) {
             for rect in &m.rects {
                 let corners = [[rect[0], rect[1]], [rect[2], rect[1]], [rect[0], rect[3]], [rect[2], rect[3]]].map(|[x, y]| view.to_device(x, y));
                 let lo = |i: usize| (corners.iter().map(|c| c[i]).fold(f64::MAX, f64::min) / k) as f32;

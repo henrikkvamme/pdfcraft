@@ -416,24 +416,26 @@ fn inherited_colour_spaces_do_not_hide_the_boxes() {
     }
 }
 
-/// A Redact annotation written in place (not an object) can't be found again, so it is
-/// refused, even when another mark is listed twice and the counts would agree.
+/// Redact annotations written in place in /Annots, and one listed twice, are read as the
+/// renderer reads them: each gets its box.
 #[test]
-fn a_mark_written_in_place_is_refused() {
+fn marks_written_in_place_get_their_boxes() {
     let file = page(
         "",
         VISIBLE,
-        "/Annots [6 0 R 6 0 R << /Type /Annot /Subtype /Redact /Rect [40 190 200 215] >>]",
+        "/Annots [6 0 R 6 0 R << /Type /Annot /Subtype /Redact /Rect [40 190 250 220] /IC [0 0 0] >>]",
         "",
-        &["<< /Type /Annot /Subtype /Redact /Rect [40 110 200 135] >>".to_string()],
+        &["<< /Type /Annot /Subtype /Redact /Rect [40 110 250 135] /IC [0 0 0] >>".to_string()],
     );
     let mut s = Session::new();
     let id = s.open("inline.pdf", None, Arc::new(file), None).unwrap();
-    assert!(
-        matches!(s.secure_copy_job(id, SecureOptions::default()), Err(EditError::SecureCopy(SecureError::PageTree(_)))),
-        "{:?}",
-        s.secure_copy_job(id, SecureOptions::default()).err()
-    );
+    let out = s.secure_copy_job(id, SecureOptions { dpi: 72.0, ocr: false }).unwrap().run(None, |_, _| true).unwrap();
+    assert_eq!(out.report.marks, 3);
+    let img = render(&out.bytes, 1.0);
+    // [40 190 250 220] is pixels y 80..110, [40 110 250 135] is y 165..190.
+    for (y0, y1) in [(82, 108), (167, 188)] {
+        assert!((y0..y1).all(|y| (42..248).all(|x| px(&img, x as f32, y as f32)[0] < 60)), "rows {y0}..{y1} not boxed");
+    }
 }
 
 /// A box covers every pixel its rectangle touches and GROW_PX more on each side, through the
@@ -442,14 +444,7 @@ fn a_mark_written_in_place_is_refused() {
 fn a_box_covers_the_pixels_its_rectangle_touches() {
     // 2 pixels per point, y down: user (x, y) is pixel (2x, 2·(100 − y)).
     let geometry = PageGeometry { object: Some(3), scale: 2.0, width: 100, height: 200, transform: [2.0, 0.0, 0.0, -2.0, 0.0, 200.0] };
-    let mark = |rects: Vec<[f64; 4]>| Mark {
-        page: 0,
-        obj: ObjRef { num: 6, generation: 0 },
-        rects,
-        fill: Some([1.0, 0.0, 0.0]),
-        overlay: String::new(),
-        look: Default::default(),
-    };
+    let mark = |rects: Vec<[f64; 4]>| Redaction { rects, fill: Some([1.0, 0.0, 0.0]), overlay: false };
     let mut rgba = vec![255u8; 100 * 200 * 4];
     paint_mark(&mut rgba, &geometry, &mark(vec![[10.25, 50.0, 20.0, 60.5]])).unwrap();
     let red = |rgba: &[u8], x: usize, y: usize| rgba[(y * 100 + x) * 4..][..4] == [255, 0, 0, 255];
@@ -648,22 +643,12 @@ fn a_page_written_in_place_gets_its_box() {
     }
 }
 
-/// A Redact annotation written in place in /Annots can't be read as an object: refused. One with
-/// no readable area is refused too.
+/// A Redact annotation with no readable area: what it covers can't be known, so the copy is
+/// refused.
 #[test]
-fn a_redact_annotation_written_in_place_is_refused() {
-    let file = page(
-        "",
-        VISIBLE,
-        "/Annots [<< /Type /Annot /Subtype /Redact /Rect [40 190 250 220] >> << /Type /Annot /Subtype /Text /Rect [0 0 1 1] >>]",
-        "",
-        &[],
-    );
-    let mut s = Session::new();
-    let id = s.open("t.pdf", None, Arc::new(file), None).unwrap();
-    let job = s.secure_copy_job(id, SecureOptions::default());
-    assert!(matches!(job, Err(EditError::SecureCopy(SecureError::PageTree(_)))), "{:?}", job.err());
+fn a_mark_without_area_is_refused() {
     let no_area = page("", VISIBLE, "/Annots [6 0 R]", "", &["<< /Type /Annot /Subtype /Redact /Rect [0 0 1] >>".to_string()]);
+    let mut s = Session::new();
     let id = s.open("t.pdf", None, Arc::new(no_area), None).unwrap();
     let job = s.secure_copy_job(id, SecureOptions::default());
     assert!(matches!(job, Err(EditError::SecureCopy(SecureError::UnreadableMark(1)))), "{:?}", job.err());

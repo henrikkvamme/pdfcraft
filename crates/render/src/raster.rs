@@ -318,6 +318,17 @@ fn whole_page_settings(w: f32, h: f32, scale: f32) -> RenderSettings {
     RenderSettings { x_scale: scale, y_scale: scale, width: Some(side(w)), height: Some(side(h)), ..Default::default() }
 }
 
+/// A Redact annotation as [`PageRenderer::page_redactions`] reads it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Redaction {
+    /// The marked areas in user space, one per quadrilateral (or the `/Rect`).
+    pub rects: Vec<[f64; 4]>,
+    /// The box colour (`/IC` as RGB, 0–1); `None` when it has none.
+    pub fill: Option<[f64; 3]>,
+    /// It has `/OverlayText`.
+    pub overlay: bool,
+}
+
 /// Where a whole-page raster puts a page: what [`PageRenderer::render`] draws for a request of
 /// that page and scale without a tile.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -498,42 +509,66 @@ impl PageRenderer {
         .flatten()
     }
 
-    /// The entries of `page`'s own `/Annots`, in order, read from the page dictionary this
-    /// renderer draws: the object number and generation of each entry that is a reference, and
-    /// `None` for a Redact annotation written in place (other annotations written in place are
-    /// left out). Empty when the page has none; `None` when the page doesn't exist. A caller can
-    /// read the annotations of exactly the page that is drawn, whatever object (if any) the page
-    /// itself is.
-    pub fn page_annotations(&self, page: usize) -> Option<Vec<Option<(u32, u16)>>> {
-        use hayro::hayro_syntax::object::{Array, MaybeRef, Name, Object};
+    /// The Redact annotations of `page`, read from the page dictionary this renderer draws, the
+    /// way it reads the annotations it draws (each `/Annots` entry, a reference or written in
+    /// place, `/Subtype` resolved), and how many have no readable area. `None` when the page
+    /// doesn't exist. A caller placing boxes over what [`Self::render`] drew reads the marks
+    /// here, so the marks and the pictures come from one reading of the file.
+    pub fn page_redactions(&self, page: usize) -> Option<(Vec<Redaction>, usize)> {
+        use hayro::hayro_syntax::object::{Array, Dict, Name};
         let pdf = self.pdf.as_ref()?;
         catch_unwind(AssertUnwindSafe(|| {
             let pages = pdf.pages();
             let p = pages.get(page)?;
-            let Some(annots) = p.raw().get::<Array<'_>>(b"Annots") else { return Some(Vec::new()) };
-            Some(
-                annots
-                    .raw_iter()
-                    .filter_map(|entry: MaybeRef<Object<'_>>| match entry {
-                        MaybeRef::Ref(r) => Some(u32::try_from(r.obj_number).ok().zip(u16::try_from(r.gen_number).ok())),
-                        MaybeRef::NotRef(Object::Dict(d)) if d.get::<Name<'_>>(b"Subtype").is_some_and(|n| n.as_ref() == b"Redact") => Some(None),
-                        MaybeRef::NotRef(_) => None,
+            let (mut found, mut unreadable) = (Vec::new(), 0usize);
+            let Some(annots) = p.raw().get::<Array<'_>>(b"Annots") else { return Some((found, unreadable)) };
+            for annot in annots.iter::<Dict<'_>>() {
+                if annot.get::<Name<'_>>(b"Subtype").as_deref() != Some(b"Redact".as_slice()) {
+                    continue;
+                }
+                let finite = |r: &[f64; 4]| r.iter().all(|v| v.is_finite());
+                let quads: Vec<f64> = annot.get::<Array<'_>>(b"QuadPoints").map(|a| a.iter::<f64>().collect()).unwrap_or_default();
+                let mut rects: Vec<[f64; 4]> = quads
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|q| {
+                        let (xs, ys) = ([q[0], q[2], q[4], q[6]], [q[1], q[3], q[5], q[7]]);
+                        [
+                            xs.iter().copied().fold(f64::MAX, f64::min),
+                            ys.iter().copied().fold(f64::MAX, f64::min),
+                            xs.iter().copied().fold(f64::MIN, f64::max),
+                            ys.iter().copied().fold(f64::MIN, f64::max),
+                        ]
                     })
-                    .collect(),
-            )
+                    .filter(finite)
+                    .collect();
+                if rects.is_empty() {
+                    let rect: Vec<f64> = annot.get::<Array<'_>>(b"Rect").map(|a| a.iter::<f64>().collect()).unwrap_or_default();
+                    if let [a, b, c, d] = rect[..] {
+                        let r = [a.min(c), b.min(d), a.max(c), b.max(d)];
+                        if finite(&r) {
+                            rects.push(r);
+                        }
+                    }
+                }
+                if rects.is_empty() {
+                    unreadable += 1;
+                    continue;
+                }
+                let ic: Vec<f64> = annot.get::<Array<'_>>(b"IC").map(|a| a.iter::<f64>().collect()).unwrap_or_default();
+                let fill = match ic[..] {
+                    [g] => Some([g; 3]),
+                    [r, g, b] => Some([r, g, b]),
+                    [c, m, y, k] => Some([(1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - y) * (1.0 - k)]),
+                    _ => None,
+                };
+                found.push(Redaction { rects, fill, overlay: annot.contains_key(b"OverlayText") });
+            }
+            Some((found, unreadable))
         }))
         .ok()
         .flatten()
-    }
-
-    /// The object number of each page this renderer draws, in its page order (`None` for a page
-    /// that is not an object of its own, such as a dictionary written in place in `/Kids`). A
-    /// caller that numbers pages another way can check the two agree page for page.
-    pub fn page_objects(&self) -> Vec<Option<u32>> {
-        self.pdf
-            .as_ref()
-            .map(|p| p.pages().iter().map(|page| page.raw().obj_id().and_then(|id| u32::try_from(id.obj_number).ok())).collect())
-            .unwrap_or_default()
     }
 
     /// Snapshot the work counters collected by this renderer.
