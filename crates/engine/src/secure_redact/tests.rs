@@ -430,7 +430,7 @@ fn a_mark_written_in_place_is_refused() {
     let mut s = Session::new();
     let id = s.open("inline.pdf", None, Arc::new(file), None).unwrap();
     assert!(
-        matches!(s.secure_copy_job(id, SecureOptions::default()), Err(EditError::SecureCopy(SecureError::UnreadableMark(1)))),
+        matches!(s.secure_copy_job(id, SecureOptions::default()), Err(EditError::SecureCopy(SecureError::PageTree(_)))),
         "{:?}",
         s.secure_copy_job(id, SecureOptions::default()).err()
     );
@@ -582,7 +582,7 @@ fn marks_come_from_the_pages_that_are_drawn() {
     let mut s = Session::new();
     let id = s.open("drawn.pdf", None, Arc::new(file), None).unwrap();
     let job = s.secure_copy_job(id, SecureOptions { dpi: 72.0, ocr: false }).unwrap();
-    assert_eq!(job.pages, [3, 4], "the renderer draws objects 3 and 4");
+    assert_eq!(job.pages, 2, "the renderer draws objects 3 and 4");
     let out = job.run(None, |_, _| true).unwrap();
     assert_eq!(out.report.marks, 2);
     let mut r = PageRenderer::new(Arc::new(out.bytes), RenderConfig::default());
@@ -612,4 +612,59 @@ fn a_mark_on_a_page_not_drawn_is_not_needed() {
     let id = s.open("t.pdf", None, Arc::new(file), None).unwrap();
     let job = s.secure_copy_job(id, SecureOptions::default());
     assert!(matches!(job, Err(EditError::SecureCopy(SecureError::NoMarks))), "{:?}", job.err());
+}
+
+/// A page written in place in an indirect /Kids array, next to an ordinary page: the marks of each
+/// are read from the page dictionary the renderer draws, so both get their boxes.
+#[test]
+fn a_page_written_in_place_gets_its_box() {
+    let body = |word: &str| format!("BT /F1 14 Tf 40 200 Td (Client {word} Holdings) Tj ET");
+    let file = pdf(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids 9 0 R /Count 2 /MediaBox [0 0 612 300] >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> >> /Contents 6 0 R /Annots [4 0 R] >>".to_string(),
+            "<< /Type /Annot /Subtype /Redact /Rect [40 190 250 220] /IC [0 0 0] >>".to_string(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_string(),
+            stream("", &body("FIRST111")),
+            stream("", &body("SECOND22")),
+            "<< /Type /Annot /Subtype /Redact /Rect [40 190 250 220] /IC [0 0 0] >>".to_string(),
+            "[3 0 R << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 5 0 R >> >> /Contents 7 0 R /Annots [8 0 R] >>]".to_string(),
+        ],
+        "",
+    );
+    let mut s = Session::new();
+    let id = s.open("inline.pdf", None, Arc::new(file), None).unwrap();
+    let job = s.secure_copy_job(id, SecureOptions { dpi: 72.0, ocr: false }).unwrap();
+    let pages = job.pages();
+    let out = job.run(None, |_, _| true).unwrap();
+    assert_eq!(out.report.marks, pages, "one mark per page");
+    let mut r = PageRenderer::new(Arc::new(out.bytes), RenderConfig::default());
+    for page in 0..pages {
+        let shot = r.render(RenderRequest { page, scale: 1.0, ..Default::default() });
+        let img = (shot.width, shot.height, shot.rgba.to_vec());
+        let boxed = (82..108).all(|y| (42..248).all(|x| px(&img, x as f32, y as f32)[0] < 60));
+        assert!(boxed, "page {} of {pages} has no box", page + 1);
+    }
+}
+
+/// A Redact annotation written in place in /Annots can't be read as an object: refused. One with
+/// no readable area is refused too.
+#[test]
+fn a_redact_annotation_written_in_place_is_refused() {
+    let file = page(
+        "",
+        VISIBLE,
+        "/Annots [<< /Type /Annot /Subtype /Redact /Rect [40 190 250 220] >> << /Type /Annot /Subtype /Text /Rect [0 0 1 1] >>]",
+        "",
+        &[],
+    );
+    let mut s = Session::new();
+    let id = s.open("t.pdf", None, Arc::new(file), None).unwrap();
+    let job = s.secure_copy_job(id, SecureOptions::default());
+    assert!(matches!(job, Err(EditError::SecureCopy(SecureError::PageTree(_)))), "{:?}", job.err());
+    let no_area = page("", VISIBLE, "/Annots [6 0 R]", "", &["<< /Type /Annot /Subtype /Redact /Rect [0 0 1] >>".to_string()]);
+    let id = s.open("t.pdf", None, Arc::new(no_area), None).unwrap();
+    let job = s.secure_copy_job(id, SecureOptions::default());
+    assert!(matches!(job, Err(EditError::SecureCopy(SecureError::UnreadableMark(1)))), "{:?}", job.err());
 }

@@ -498,6 +498,34 @@ impl PageRenderer {
         .flatten()
     }
 
+    /// The entries of `page`'s own `/Annots`, in order, read from the page dictionary this
+    /// renderer draws: the object number and generation of each entry that is a reference, and
+    /// `None` for a Redact annotation written in place (other annotations written in place are
+    /// left out). Empty when the page has none; `None` when the page doesn't exist. A caller can
+    /// read the annotations of exactly the page that is drawn, whatever object (if any) the page
+    /// itself is.
+    pub fn page_annotations(&self, page: usize) -> Option<Vec<Option<(u32, u16)>>> {
+        use hayro::hayro_syntax::object::{Array, MaybeRef, Name, Object};
+        let pdf = self.pdf.as_ref()?;
+        catch_unwind(AssertUnwindSafe(|| {
+            let pages = pdf.pages();
+            let p = pages.get(page)?;
+            let Some(annots) = p.raw().get::<Array<'_>>(b"Annots") else { return Some(Vec::new()) };
+            Some(
+                annots
+                    .raw_iter()
+                    .filter_map(|entry: MaybeRef<Object<'_>>| match entry {
+                        MaybeRef::Ref(r) => Some(u32::try_from(r.obj_number).ok().zip(u16::try_from(r.gen_number).ok())),
+                        MaybeRef::NotRef(Object::Dict(d)) if d.get::<Name<'_>>(b"Subtype").is_some_and(|n| n.as_ref() == b"Redact") => Some(None),
+                        MaybeRef::NotRef(_) => None,
+                    })
+                    .collect(),
+            )
+        }))
+        .ok()
+        .flatten()
+    }
+
     /// The object number of each page this renderer draws, in its page order (`None` for a page
     /// that is not an object of its own, such as a dictionary written in place in `/Kids`). A
     /// caller that numbers pages another way can check the two agree page for page.
